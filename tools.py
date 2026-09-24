@@ -5,6 +5,11 @@ real sqlite database, the file tools touch a sandboxed directory, kb_search
 retrieves from a real local corpus. `send_email` is the one deliberate
 simulation -- it writes to an outbox file instead of sending, so side effects
 are observable without being real.
+
+Tools that touch run state (blackboard, workspace files, outbox) are registered
+with needs_ctx=True and receive a ToolCtx naming the run, the calling agent and
+the round. There is no global run state: two runs in one process cannot see
+each other's writes.
 """
 from __future__ import annotations
 
@@ -12,10 +17,9 @@ import ast
 import asyncio
 import json
 import operator
+import posixpath
 import sqlite3
-import time
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any, Callable
 
 from config import CFG
@@ -28,6 +32,7 @@ class Tool:
     description: str
     parameters: dict          # JSON schema
     fn: Callable[..., Any]    # sync or async
+    needs_ctx: bool = False   # if True, called as fn(ctx, **args)
 
     def spec(self) -> dict:
         return {"type": "function",
@@ -36,13 +41,22 @@ class Tool:
                              "parameters": self.parameters}}
 
 
+@dataclass
+class ToolCtx:
+    """Who is calling a tool, from which run. Built by the runtime, never by the model."""
+    run: Any                  # RunContext
+    agent_idx: int
+    agent_name: str
+    round_idx: int
+
+
 class ToolRegistry:
     def __init__(self):
         self._tools: dict[str, Tool] = {}
 
-    def register(self, name, description, parameters):
+    def register(self, name, description, parameters, needs_ctx: bool = False):
         def deco(fn):
-            self._tools[name] = Tool(name, description, parameters, fn)
+            self._tools[name] = Tool(name, description, parameters, fn, needs_ctx)
             return fn
         return deco
 
@@ -53,12 +67,16 @@ class ToolRegistry:
         names = names if names is not None else self.names()
         return [self._tools[n].spec() for n in names if n in self._tools]
 
-    async def call(self, name: str, args: dict) -> str:
+    async def call(self, name: str, args: dict, ctx: ToolCtx | None = None) -> str:
         tool = self._tools.get(name)
         if tool is None:
             return json.dumps({"error": f"unknown tool '{name}'"})
+        if "ctx" in args:   # the model must not be able to pose as another run or agent
+            return json.dumps({"error": f"bad arguments for {name}: 'ctx' is reserved"})
+        if tool.needs_ctx and ctx is None:
+            raise RuntimeError(f"tool '{name}' needs a ToolCtx")
         try:
-            result = tool.fn(**args)
+            result = tool.fn(ctx, **args) if tool.needs_ctx else tool.fn(**args)
             if asyncio.iscoroutine(result):
                 result = await result
         except TypeError as e:
@@ -135,6 +153,9 @@ def _db() -> sqlite3.Connection:
         _DB = sqlite3.connect(":memory:", check_same_thread=False)
         _DB.executescript(_SEED)
         _DB.row_factory = sqlite3.Row
+        # Shared by every run in the process, so it must be immutable. The prefix
+        # check below is not enough on its own: SQLite accepts `WITH ... DELETE`.
+        _DB.execute("PRAGMA query_only = ON")
     return _DB
 
 
@@ -193,13 +214,13 @@ def kb_search(query: str, k: int = 3):
     return {"query": query, "hits": hits or [{"note": "no matching passages"}]}
 
 
-# =============================================================== file sandbox
-def _resolve(rel: str) -> Path:
-    CFG.workspace.mkdir(parents=True, exist_ok=True)
-    target = (CFG.workspace / rel).resolve()
-    if not str(target).startswith(str(CFG.workspace.resolve())):
+# ========================================================= per-run workspace
+def _norm(rel: str) -> str:
+    """Normalise a workspace path; reject anything absolute or escaping the root."""
+    p = posixpath.normpath(rel.strip())
+    if rel.strip().startswith("/") or p == ".." or p.startswith("../") or p in ("", "."):
         raise ValueError("path escapes the workspace sandbox")
-    return target
+    return p
 
 
 @REGISTRY.register(
@@ -207,32 +228,30 @@ def _resolve(rel: str) -> Path:
     {"type": "object",
      "properties": {"path": {"type": "string", "description": "Relative path, e.g. 'report.md'."},
                     "content": {"type": "string"}},
-     "required": ["path", "content"]})
-def write_file(path: str, content: str):
-    target = _resolve(path)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(content)
+     "required": ["path", "content"]},
+    needs_ctx=True)
+def write_file(ctx: ToolCtx, path: str, content: str):
+    ctx.run.files[_norm(path)] = content
     return {"path": path, "bytes_written": len(content.encode())}
 
 
 @REGISTRY.register(
     "read_file", "Read a text file from the shared workspace.",
-    {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]})
-def read_file(path: str):
-    target = _resolve(path)
-    if not target.exists():
+    {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]},
+    needs_ctx=True)
+def read_file(ctx: ToolCtx, path: str):
+    content = ctx.run.files.get(_norm(path))
+    if content is None:
         return {"error": f"no such file: {path}"}
-    return {"path": path, "content": target.read_text()[:8000]}
+    return {"path": path, "content": content[:8000]}
 
 
 @REGISTRY.register(
     "list_files", "List files currently in the shared workspace.",
-    {"type": "object", "properties": {}, "required": []})
-def list_files():
-    CFG.workspace.mkdir(parents=True, exist_ok=True)
-    files = [str(p.relative_to(CFG.workspace))
-             for p in sorted(CFG.workspace.rglob("*")) if p.is_file()]
-    return {"files": files}
+    {"type": "object", "properties": {}, "required": []},
+    needs_ctx=True)
+def list_files(ctx: ToolCtx):
+    return {"files": sorted(ctx.run.files)}
 
 
 # ============================================================ simulated email
@@ -240,10 +259,30 @@ def list_files():
     "send_email", "Send an email. SIMULATED: appends to workspace/outbox.jsonl, nothing leaves the machine.",
     {"type": "object",
      "properties": {"to": {"type": "string"}, "subject": {"type": "string"}, "body": {"type": "string"}},
-     "required": ["to", "subject", "body"]})
-def send_email(to: str, subject: str, body: str):
-    CFG.workspace.mkdir(parents=True, exist_ok=True)
-    record = {"ts": time.time(), "to": to, "subject": subject, "body": body}
-    with (CFG.workspace / "outbox.jsonl").open("a") as f:
-        f.write(json.dumps(record) + "\n")
+     "required": ["to", "subject", "body"]},
+    needs_ctx=True)
+def send_email(ctx: ToolCtx, to: str, subject: str, body: str):
+    record = {"seq": ctx.run.clock(), "from": ctx.agent_name,
+              "to": to, "subject": subject, "body": body}
+    ctx.run.files["outbox.jsonl"] = ctx.run.files.get("outbox.jsonl", "") + json.dumps(record) + "\n"
     return {"status": "queued (simulated)", "to": to, "subject": subject}
+
+
+# ================================================================ blackboard
+@REGISTRY.register(
+    "blackboard_write", "Publish a finding to the shared blackboard so other agents can read it.",
+    {"type": "object",
+     "properties": {"key": {"type": "string", "description": "Short identifier, e.g. 'q2_revenue'."},
+                    "value": {"type": "string", "description": "The content to share."}},
+     "required": ["key", "value"]},
+    needs_ctx=True)
+def blackboard_write(ctx: ToolCtx, key: str, value: str):
+    return ctx.run.blackboard.write(key, value, author=ctx.agent_name, round_idx=ctx.round_idx)
+
+
+@REGISTRY.register(
+    "blackboard_read", "Read a shared blackboard entry, or omit 'key' to list available keys.",
+    {"type": "object", "properties": {"key": {"type": "string"}}, "required": []},
+    needs_ctx=True)
+def blackboard_read(ctx: ToolCtx, key: str | None = None):
+    return ctx.run.blackboard.read(key)

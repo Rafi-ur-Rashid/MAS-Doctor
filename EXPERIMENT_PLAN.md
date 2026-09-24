@@ -332,7 +332,7 @@ Total is about $400–600 for C01–C23 and C25 at the gpt-5-mini prices in §8,
   - A `RunContext` that owns everything mutable in a run: the environment, the memory stores, the blackboard, the event log and the cache namespace.
   - Remove the `Blackboard` singleton and the module-level stores.
   - Memory starts from a **named snapshot** (empty by default); nothing carries over between runs implicitly.
-  - Deterministic scheduling: sequential, or parallel with each round's writes buffered and committed in agent-index order.
+  - Deterministic scheduling: sequential, or parallel in **lockstep**. In lockstep, all agents make their next LLM call concurrently, then their tool calls run one agent at a time in index order. (Changed at C02 from "buffer each round's writes and commit them in agent order". Buffering cannot work with AgentDojo's tools, because a tool's return value depends on the state the call itself changes. Lockstep gives the same repeatability for both our tools and AgentDojo's.)
   - No wall-clock time inside any prompt.
 - Check, with the fake LLM:
   - two runs executed concurrently in one process share no state;

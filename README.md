@@ -1,8 +1,9 @@
 # Local Multi-Agent System
 
 A graph-structured MAS in the shape of XG-Guard's setup, but with the parts that were
-simulated there made real: tools actually execute, memory actually persists and is
-retrieved by embedding similarity, and agents share a live blackboard.
+simulated there made real: tools actually execute, memory is stored and retrieved by
+embedding similarity, and agents share a live blackboard. Every run is isolated and
+repeatable: it starts from a named state snapshot and touches no global state.
 
 No framework — plain `openai` + `numpy`, ~900 lines. Nothing is hidden behind a
 LangGraph/AutoGen abstraction, so every prompt and every message hop is inspectable.
@@ -15,6 +16,8 @@ LangGraph/AutoGen abstraction, so every prompt and every message hop is inspecta
 | `llm.py`      | async OpenAI wrapper: retries, concurrency cap, usage accounting, offline fake mode |
 | `tools.py`    | the tool registry + 8 executing tools |
 | `memory.py`   | working / episodic (vector) / shared blackboard |
+| `run_context.py` | one run's mutable state + named state snapshots |
+| `manifest.py` | versions, models and code hash for every run record |
 | `agent.py`    | one agent: persona, tool subset, tool-calling loop |
 | `topology.py` | chain, ring, star, tree, complete, random |
 | `graph.py`    | round-based message passing + synthesis + transcript |
@@ -30,20 +33,28 @@ python run.py --manifest                 # pinned versions, models, code hash
 python run.py --topology random --sparsity 0.5 --seed 7 --rounds 3
 python run.py --schedule sequential      # downstream roles see this round's work
 python run.py --task "Which region is underperforming and why?"
+python run.py --state-save day1          # keep this run's end state as snapshot 'day1'
+python run.py --state-from day1          # start the next run from it
 ```
 
-`--fresh` wipes persisted memory and the blackboard first; without it, agents carry
-episodic memory across runs, which is usually what you want on the second run.
+Every run starts from the `empty` state unless `--state-from` names a snapshot. Nothing
+carries over between runs implicitly. Snapshots live in `state/snapshots/<name>.json`, hold
+episodic memory, the blackboard and workspace files, and are never overwritten.
 
 ## The three layers, concretely
 
 **Tools** (`tools.py`) — all real except one. `calculator` evaluates via a whitelisted
 AST walk. `sql_query` runs against a seeded in-memory sqlite (employees / products /
 sales), SELECT-only, single statement. `kb_search` retrieves from the markdown corpus in
-`knowledge_base/`. `read_file` / `write_file` / `list_files` are sandboxed to
-`workspace/` with an escape check. `blackboard_read` / `blackboard_write` are the shared
-channel. `send_email` is the one deliberate simulation: it appends to
-`workspace/outbox.jsonl` so the side effect is observable without leaving the machine.
+`knowledge_base/`. The database is opened with `PRAGMA query_only`, because the SELECT
+check alone lets `WITH ... DELETE` through. `read_file` / `write_file` / `list_files`
+work on the run's own in-memory workspace, with a path-escape check.
+`blackboard_read` / `blackboard_write` are the shared channel. `send_email` is the one
+deliberate simulation: it appends to `outbox.jsonl` in the run's workspace, so the side
+effect is observable without leaving the machine.
+
+Tools that touch run state are registered with `needs_ctx=True` and receive a `ToolCtx`
+(run, agent, round) from the runtime. The model cannot supply or override it.
 
 Dispatch is OpenAI native function calling, and results are fed back as `role: "tool"`
 messages, looping up to `CFG.max_tool_iters` times before the agent is forced to answer.
@@ -51,22 +62,27 @@ messages, looping up to `CFG.max_tool_iters` times before the agent is forced to
 **Memory** (`memory.py`) — three distinct things:
 - *Working*: the message list sent to the model, windowed to the last `working_memory_turns`
   exchanges, never slicing a `tool` result away from its call.
-- *Episodic*: per-agent `VectorStore`, embedded with `text-embedding-3-small`, persisted to
-  `state/agent_N_episodic.json`, retrieved by cosine similarity and prepended to each turn's
-  prompt. Falls back to hashed bag-of-words embeddings if the endpoint errors, so a
-  network problem degrades retrieval instead of killing the run.
-- *Blackboard*: shared key/value store with an append-only authored log, persisted to
-  `state/blackboard.json`. This is how agents that aren't graph neighbours reach each other.
+- *Episodic*: per-agent `VectorStore`, embedded with `text-embedding-3-small`, retrieved
+  by cosine similarity and prepended to each turn's prompt. If the embedding endpoint
+  errors, the run stops: hashed vectors live in a different space, so a silent fallback
+  would change retrieval mid-experiment. `MAS_EMBED_FALLBACK=1` allows it for demos.
+- *Blackboard*: shared key/value store with an append-only authored log. This is how
+  agents that aren't graph neighbours reach each other.
+
+Ordering uses the run's logical clock (`seq`), never wall-clock time.
 
 **Topology** (`topology.py`) — `adj[i][j] == 1` means i's messages reach j, so column j is
 agent j's in-neighbours. Same convention as XG-Guard, so transcripts are comparable.
 
 ## Scheduling
 
-`--schedule parallel` (default) runs every agent at once against a *snapshot* of the
-previous round. Fast, and it's what XG-Guard does. The catch: an agent cannot see work its
-peers do in the same round, so a downstream role (the Writer) can read an empty blackboard
-in round 0 and have nothing to write.
+`--schedule parallel` (default) runs every agent against a *snapshot* of the previous
+round's messages, which is what XG-Guard does. Within a round the agents move in
+lockstep: all of them make their next LLM call concurrently, then their tool calls run one
+agent at a time in index order. Shared state therefore changes in the same order however
+fast each API call returns, so the run is repeatable. A tool effect is visible to other
+agents from the next step on. The catch: an agent does not see its peers' *messages* from
+the same round, so a downstream role (the Writer) can have little to write in round 0.
 
 `--schedule sequential` runs agents in index order within a round, each seeing whatever
 its neighbours already produced this round. Slower — no parallelism — but consumer roles
@@ -74,12 +90,15 @@ actually have something to consume.
 
 ## Output
 
-Each run writes `runs/run_<timestamp>.json` containing the task, `adj_matrix`,
+Each run writes `runs/<run_id>/transcript.json` and `runs/<run_id>/meta.json`.
+`transcript.json` contains no wall-clock time, so the same run from the same state gives a
+byte-identical file. `meta.json` holds timings, token usage and the manifest.
+The transcript contains the task, `adj_matrix`,
 `system_prompts`, and `communication_data` shaped as `[[[agent_idx, text], ...], ...]` —
 one list per round. That is deliberately XG-Guard's transcript schema, so these runs can
 be fed to a graph-anomaly detector later without reshaping. Also included: every tool call
-with arguments and truncated results, the blackboard and its authored log, the synthesis,
-and token usage.
+with arguments and truncated results, the blackboard and its authored log, the run's
+workspace files, and the synthesis.
 
 ## Adding to it
 
@@ -91,6 +110,10 @@ A tool is one decorated function:
 def my_tool(x: str):
     return {"result": ...}          # dict or str; dicts are JSON-encoded
 ```
+
+A tool that reads or changes run state adds `needs_ctx=True` and takes the context first:
+`def my_tool(ctx: ToolCtx, x: str)`, then uses `ctx.run.blackboard`, `ctx.run.files`,
+`ctx.agent_name`. Never keep run state in a module-level variable.
 
 Then list its name in an `AgentSpec.tools` in `team.py`. Agents only ever see the tools
 their spec names — that asymmetry is what forces them to actually talk to each other.

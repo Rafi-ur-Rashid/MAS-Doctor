@@ -10,21 +10,26 @@ import numpy as np
 
 from agent import Agent, AgentSpec
 from config import CFG
-from memory import Blackboard
 
 
 class AgentGraph:
-    def __init__(self, specs: list[AgentSpec], adj: np.ndarray, llm, persist: bool = True):
+    def __init__(self, specs: list[AgentSpec], adj: np.ndarray, ctx):
+        """ctx: this run's RunContext. All mutable state lives there."""
         assert len(specs) == len(adj), "one spec per node required"
         self.adj = adj
-        self.llm = llm
+        self.ctx = ctx
+        self.llm = ctx.llm
+        self.blackboard = ctx.blackboard
         names = [s.name for s in specs]
+        assert len(set(names)) == len(names), "agent names must be unique"
         self.agents = [
-            Agent(i, s, llm, peers=[n for k, n in enumerate(names) if k != i], persist=persist)
+            Agent(i, s, ctx, peers=[n for k, n in enumerate(names) if k != i])
             for i, s in enumerate(specs)
         ]
-        self.blackboard = Blackboard(persist=persist)
         self.communication_data: list[list[list]] = []
+        self.final_answer: str | None = None
+        self.task: str | None = None
+        self.schedule: str | None = None
 
     # ------------------------------------------------------------ prompting
     def _initial_prompt(self, task: str) -> str:
@@ -52,21 +57,27 @@ class AgentGraph:
     # ----------------------------------------------------------------- runs
     async def run(self, task: str, rounds: int = 2, schedule: str = "parallel",
                   verbose: bool = True) -> list[list[list]]:
-        """schedule='parallel'   -- every agent acts at once on a snapshot of the
-        previous round (fast; what XG-Guard does). Agents cannot see work their
-        peers do in the same round, so early blackboard reads can come up empty.
+        """schedule='parallel'   -- every agent acts on a snapshot of the previous
+        round's messages (what XG-Guard does). Within the round, agents proceed in
+        lockstep: all of them make their next LLM call concurrently, then their tool
+        calls run one agent at a time in index order. Shared state therefore changes
+        in the same order however fast each API call returns, so a run is repeatable.
+        Tool effects are visible to other agents from the next step on.
 
         schedule='sequential' -- agents act in index order within a round, each
         seeing whatever its neighbours already produced this round. Slower, but
         downstream roles (a writer, a reporter) actually have something to consume.
         """
+        if schedule not in ("parallel", "sequential"):
+            raise ValueError(f"unknown schedule '{schedule}' (parallel|sequential)")
+        self.task, self.schedule = task, schedule
         self.communication_data = []
 
         if verbose:
             print(f"\n=== round 0: independent work "
                   f"({len(self.agents)} agents, {schedule}) ===")
         responses = await self._step([self._initial_prompt(task)] * len(self.agents),
-                                     0, schedule, task, initial=True)
+                                     0, schedule, task)
         self._record(responses, verbose)
 
         for r in range(1, rounds + 1):
@@ -77,7 +88,7 @@ class AgentGraph:
 
         return self.communication_data
 
-    async def _step(self, prompts, round_idx, schedule, task, initial=False):
+    async def _step(self, prompts, round_idx, schedule, task):
         n = len(self.agents)
 
         def prompt_for(i):
@@ -85,19 +96,22 @@ class AgentGraph:
                 return prompts[i]
             return self._round_prompt(i, task, round_idx)
 
-        if schedule == "parallel":
-            # snapshot every prompt first, so nobody reads a peer's fresh reply
-            fixed = [prompt_for(i) for i in range(n)]
-            return await asyncio.gather(
-                *(self.agents[i].act(fixed[i], round_idx) for i in range(n)))
-
         if schedule == "sequential":
-            out = []
-            for i in range(n):
-                out.append(await self.agents[i].act(prompt_for(i), round_idx))
-            return out
+            return [await self.agents[i].act(prompt_for(i), round_idx) for i in range(n)]
 
-        raise ValueError(f"unknown schedule '{schedule}' (parallel|sequential)")
+        # parallel, in lockstep. Snapshot every prompt first, so nobody reads a
+        # peer's fresh reply.
+        turns = [self.agents[i].turn(prompt_for(i), round_idx) for i in range(n)]
+        await asyncio.gather(*(t.begin() for t in turns))          # private memory only
+        active = turns
+        while active:
+            await asyncio.gather(*(t.think() for t in active))     # LLM calls, concurrent
+            for t in active:                                       # shared state, in order
+                await t.execute_tools()
+            active = [t for t in active if not t.done]
+        # in order: storing a memory ticks the run clock, so its order must not
+        # depend on which embedding call returns first
+        return [await t.finish() for t in turns]
 
     def _record(self, responses: list[str], verbose: bool) -> None:
         self.communication_data.append([[i, t] for i, t in enumerate(responses)])
@@ -120,16 +134,18 @@ class AgentGraph:
              "content": f"TASK: {task}\n\nSHARED BLACKBOARD:\n{shared}\n\nFINAL POSITIONS:\n{positions}"},
         ]
         msg = await self.llm.chat(messages)
-        return msg.content or ""
+        self.final_answer = msg.content or ""
+        return self.final_answer
 
     # ------------------------------------------------------------ transcript
-    def save(self, task: str, final_answer: str, out_dir: Path | None = None) -> Path:
-        out_dir = out_dir or CFG.runs_dir
-        out_dir.mkdir(parents=True, exist_ok=True)
-        path = out_dir / f"run_{time.strftime('%Y%m%d_%H%M%S')}.json"
-        payload = {
-            "task": task,
+    def transcript(self) -> dict:
+        """Everything the run produced. Contains no wall-clock time and no run id,
+        so the same run from the same state yields a byte-identical file."""
+        return {
+            "task": self.task,
             "model": CFG.model,
+            "schedule": self.schedule,
+            "state_from": self.ctx.state_from,
             "adj_matrix": self.adj.tolist(),
             "system_prompts": [a.system_prompt for a in self.agents],
             "agent_names": [a.name for a in self.agents],
@@ -138,8 +154,20 @@ class AgentGraph:
             "tool_calls": {a.name: a.tool_log for a in self.agents},
             "blackboard": self.blackboard.data,
             "blackboard_log": self.blackboard.log,
-            "final_answer": final_answer,
-            "usage": str(self.llm.usage),
+            "files": self.ctx.files,
+            "final_answer": self.final_answer,
         }
-        path.write_text(json.dumps(payload, indent=2, default=str))
-        return path
+
+    def save(self, run_id: str | None = None, out_dir: Path | None = None,
+             started: float | None = None) -> Path:
+        """Writes runs/<run_id>/transcript.json (deterministic) and meta.json
+        (wall-clock times, usage, manifest). Refuses to overwrite a run."""
+        from manifest import build_manifest   # imported here: manifest imports llm/config only
+        run_id = run_id or time.strftime("run_%Y%m%d_%H%M%S")
+        run_dir = (out_dir or CFG.runs_dir) / run_id
+        run_dir.mkdir(parents=True, exist_ok=False)
+        (run_dir / "transcript.json").write_text(json.dumps(self.transcript(), indent=2))
+        meta = {"run_id": run_id, "started": started, "finished": time.time(),
+                "usage": vars(self.ctx.usage), "manifest": build_manifest()}
+        (run_dir / "meta.json").write_text(json.dumps(meta, indent=2))
+        return run_dir

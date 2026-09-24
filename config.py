@@ -25,6 +25,8 @@ class Config:
     # max_completion_tokens also covers hidden reasoning tokens, hence the larger budget.
     reasoning_effort: str = os.getenv("MAS_REASONING_EFFORT", "low")
     max_completion_tokens: int = 4096
+    # If the embedding API fails: False = raise (experiments), True = hashed fallback (demos).
+    embed_fallback: bool = bool(os.getenv("MAS_EMBED_FALLBACK"))
 
     # --- benchmark ---
     agentdojo_benchmark: str = "v1.2.2"
@@ -41,15 +43,14 @@ class Config:
 
     # --- paths ---
     root: Path = ROOT
-    workspace: Path = ROOT / "workspace"      # sandbox for file tools
     kb_dir: Path = ROOT / "knowledge_base"    # corpus for kb_search
-    state_dir: Path = ROOT / "state"          # persisted memory + blackboard
+    state_dir: Path = Path(os.getenv("MAS_STATE_DIR", ROOT / "state"))   # named state snapshots
     runs_dir: Path = Path(os.getenv("MAS_RUNS_DIR", ROOT / "runs"))   # transcripts
 
     fake_llm: bool = bool(os.getenv("MAS_FAKE_LLM"))
 
     def ensure_dirs(self) -> None:
-        for d in (self.workspace, self.kb_dir, self.state_dir, self.runs_dir):
+        for d in (self.kb_dir, self.state_dir, self.runs_dir):
             d.mkdir(parents=True, exist_ok=True)
 
 

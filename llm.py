@@ -60,7 +60,14 @@ class LLMClient:
             self._client = AsyncOpenAI(api_key=cfg.api_key, base_url=cfg.base_url)
 
     # ------------------------------------------------------------------ chat
-    async def chat(self, messages: list[dict], tools: list[dict] | None = None):
+    def for_run(self, usage: Usage) -> "RunLLM":
+        """A view of this client that also accounts usage to one run. The
+        transport (semaphore, retries) stays shared, so concurrent runs still
+        respect one process-wide concurrency cap."""
+        return RunLLM(self, usage)
+
+    async def chat(self, messages: list[dict], tools: list[dict] | None = None,
+                   usage: Usage | None = None):
         """Returns the raw assistant message object (may carry .tool_calls)."""
         if self.cfg.fake_llm:
             return _FakeMessage(messages, tools)
@@ -76,11 +83,19 @@ class LLMClient:
 
         async with self._sem:
             resp = await self._with_retry(lambda: self._client.chat.completions.create(**kwargs))
-        self.usage.add(getattr(resp, "usage", None))
+        for u in (self.usage, usage):
+            if u is not None:
+                u.add(getattr(resp, "usage", None))
         return resp.choices[0].message
 
     # ------------------------------------------------------------ embeddings
-    async def embed(self, texts: list[str]) -> list[list[float]]:
+    @property
+    def embed_space(self) -> str:
+        """Identifies the vector space embeddings live in. Vectors from different
+        spaces are not comparable, so state snapshots record and check this."""
+        return f"hash-{_HASH_DIM}" if self.cfg.fake_llm else self.cfg.embed_model
+
+    async def embed(self, texts: list[str], usage: Usage | None = None) -> list[list[float]]:
         if self.cfg.fake_llm:
             return [_hash_embed(t) for t in texts]
         try:
@@ -88,11 +103,17 @@ class LLMClient:
                 resp = await self._with_retry(
                     lambda: self._client.embeddings.create(model=self.cfg.embed_model, input=texts)
                 )
-            self.usage.embed_calls += 1
-            return [d.embedding for d in resp.data]
-        except Exception as e:  # never let memory take the run down
+        except Exception as e:
+            # Hashed vectors live in a different space from real ones, so a silent
+            # fallback would quietly change what retrieval returns mid-experiment.
+            if not self.cfg.embed_fallback:
+                raise RuntimeError(f"embedding failed and embed_fallback is off: {e}") from e
             print(f"[llm] embedding failed ({e}); falling back to hashed embeddings")
             return [_hash_embed(t) for t in texts]
+        for u in (self.usage, usage):
+            if u is not None:
+                u.embed_calls += 1
+        return [d.embedding for d in resp.data]
 
     # ----------------------------------------------------------------- retry
     async def _with_retry(self, thunk):
@@ -110,8 +131,29 @@ class LLMClient:
         raise last
 
 
+class RunLLM:
+    """Per-run view of a shared LLMClient: same transport, separate usage."""
+
+    def __init__(self, client: LLMClient, usage: Usage):
+        self.client = client
+        self.usage = usage
+
+    @property
+    def embed_space(self) -> str:
+        return self.client.embed_space
+
+    async def chat(self, messages: list[dict], tools: list[dict] | None = None):
+        return await self.client.chat(messages, tools, usage=self.usage)
+
+    async def embed(self, texts: list[str]) -> list[list[float]]:
+        return await self.client.embed(texts, usage=self.usage)
+
+
 # --------------------------------------------------------------------- utils
-def _hash_embed(text: str, dim: int = 256) -> list[float]:
+_HASH_DIM = 256
+
+
+def _hash_embed(text: str, dim: int = _HASH_DIM) -> list[float]:
     """Deterministic bag-of-words hashing embedding. Not semantic, but it keeps
     retrieval functional offline and when the embedding endpoint errors."""
     vec = [0.0] * dim

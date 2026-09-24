@@ -5,8 +5,8 @@ import json
 from dataclasses import dataclass, field
 
 from config import CFG
-from memory import AgentMemory, CURRENT_AUTHOR
-from tools import REGISTRY
+from memory import AgentMemory
+from tools import REGISTRY, ToolCtx
 
 
 @dataclass
@@ -31,64 +31,112 @@ class AgentSpec:
 
 
 class Agent:
-    def __init__(self, idx: int, spec: AgentSpec, llm, peers: list[str], persist: bool = True):
+    def __init__(self, idx: int, spec: AgentSpec, run, peers: list[str]):
         self.idx = idx
         self.spec = spec
-        self.llm = llm
+        self.run = run
+        self.llm = run.llm
         self.name = spec.name
         self.system_prompt = spec.system_prompt(idx, peers)
-        self.memory = AgentMemory(idx, self.system_prompt, llm, persist=persist)
+        self.memory = AgentMemory(self.system_prompt, run.stores[spec.name])
         self.tool_specs = REGISTRY.specs(spec.tools) if spec.tools else []
         self.last_response: str = ""
         self.tool_log: list[dict] = []
 
+    def turn(self, prompt: str, round_idx: int = 0) -> "Turn":
+        return Turn(self, prompt, round_idx)
+
     async def act(self, prompt: str, round_idx: int = 0) -> str:
-        """One turn: recall -> LLM -> (tool calls -> LLM)* -> answer -> remember."""
-        CURRENT_AUTHOR.set(self.name)
+        """One whole turn on its own: recall -> LLM -> (tool calls -> LLM)* -> answer -> remember."""
+        t = self.turn(prompt, round_idx)
+        await t.begin()
+        while not t.done:
+            await t.think()
+            await t.execute_tools()
+        return await t.finish()
 
-        recalled = await self.memory.recall(prompt)
-        content = f"{recalled}\n\n{prompt}" if recalled else prompt
-        self.memory.append({"role": "user", "content": content})
 
-        turn_tools: list[dict] = []
-        text = ""
-        for _ in range(CFG.max_tool_iters):
-            msg = await self.llm.chat(self.memory.prompt_messages(),
-                                      tools=self.tool_specs or None)
-            calls = getattr(msg, "tool_calls", None)
+class Turn:
+    """One agent turn, split into steps so a round driver can interleave agents
+    deterministically: every agent's LLM call for a step can run concurrently,
+    while tool calls, which touch shared state, run one agent at a time in a
+    fixed order. The step sequence is exactly the old loop's:
 
-            if not calls:
-                text = msg.content or ""
-                self.memory.append({"role": "assistant", "content": text})
-                break
+        up to max_tool_iters LLM calls with tools; stop at the first reply
+        without tool calls; if every one of them called tools, ask once more
+        without tools for a final answer.
+    """
 
-            self.memory.append({
-                "role": "assistant",
-                "content": msg.content,
-                "tool_calls": [{"id": c.id, "type": "function",
-                                "function": {"name": c.function.name,
-                                             "arguments": c.function.arguments}} for c in calls],
-            })
-            for call in calls:
-                try:
-                    args = json.loads(call.function.arguments or "{}")
-                except json.JSONDecodeError:
-                    args = {}
-                result = await REGISTRY.call(call.function.name, args)
-                turn_tools.append({"tool": call.function.name, "args": args,
-                                   "result": result[:500]})
-                self.memory.append({"role": "tool", "tool_call_id": call.id,
-                                    "name": call.function.name, "content": result})
-        else:
+    def __init__(self, agent: Agent, prompt: str, round_idx: int):
+        self.agent = agent
+        self.prompt = prompt
+        self.round_idx = round_idx
+        self.iters = 0
+        self.pending: list = []
+        self.records: list[dict] = []
+        self.text = ""
+        self.done = False
+
+    async def begin(self) -> None:
+        mem = self.agent.memory
+        recalled = await mem.recall(self.prompt)
+        content = f"{recalled}\n\n{self.prompt}" if recalled else self.prompt
+        mem.append({"role": "user", "content": content})
+
+    async def think(self) -> None:
+        """One LLM call. Leaves tool calls in self.pending, or finishes the turn."""
+        if self.done:
+            return
+        a, mem = self.agent, self.agent.memory
+        if self.iters >= CFG.max_tool_iters:
             # tool budget exhausted -- force a text answer
-            self.memory.append({"role": "user",
-                                "content": "Tool budget reached. Answer now using what you have."})
-            msg = await self.llm.chat(self.memory.prompt_messages(), tools=None)
-            text = msg.content or ""
-            self.memory.append({"role": "assistant", "content": text})
+            mem.append({"role": "user",
+                        "content": "Tool budget reached. Answer now using what you have."})
+            msg = await a.llm.chat(mem.prompt_messages(), tools=None)
+            self._final(msg.content or "")
+            return
 
-        self.last_response = text
-        self.tool_log.extend(turn_tools)
-        if text:
-            await self.memory.remember(text, {"kind": "own_answer", "round": round_idx})
-        return text
+        msg = await a.llm.chat(mem.prompt_messages(), tools=a.tool_specs or None)
+        self.iters += 1
+        calls = getattr(msg, "tool_calls", None)
+        if not calls:
+            self._final(msg.content or "")
+            return
+        mem.append({
+            "role": "assistant",
+            "content": msg.content,
+            "tool_calls": [{"id": c.id, "type": "function",
+                            "function": {"name": c.function.name,
+                                         "arguments": c.function.arguments}} for c in calls],
+        })
+        self.pending = list(calls)
+
+    async def execute_tools(self) -> None:
+        """Run this step's tool calls in the order the model issued them."""
+        a = self.agent
+        ctx = ToolCtx(run=a.run, agent_idx=a.idx, agent_name=a.name, round_idx=self.round_idx)
+        for call in self.pending:
+            try:
+                args = json.loads(call.function.arguments or "{}")
+            except json.JSONDecodeError:
+                args = {}
+            result = await REGISTRY.call(call.function.name, args, ctx)
+            self.records.append({"round": self.round_idx, "step": self.iters,
+                                 "tool": call.function.name, "args": args,
+                                 "result": result[:500]})
+            a.memory.append({"role": "tool", "tool_call_id": call.id,
+                             "name": call.function.name, "content": result})
+        self.pending = []
+
+    async def finish(self) -> str:
+        a = self.agent
+        a.last_response = self.text
+        a.tool_log.extend(self.records)
+        if self.text:
+            await a.memory.remember(self.text, {"kind": "own_answer", "round": self.round_idx})
+        return self.text
+
+    def _final(self, text: str) -> None:
+        self.text = text
+        self.agent.memory.append({"role": "assistant", "content": text})
+        self.done = True

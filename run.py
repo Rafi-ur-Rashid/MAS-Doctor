@@ -11,13 +11,13 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import shutil
+import time
 
 from config import CFG
 import topology
 from llm import LLMClient
 from graph import AgentGraph
-from memory import Blackboard
+from run_context import EMPTY, RunContext, SnapshotError, snapshot_path
 from team import build_team
 
 DEFAULT_TASK = (
@@ -40,8 +40,12 @@ def parse_args():
     p.add_argument("--model", default=CFG.model)
     p.add_argument("--seed", type=int, default=None)
     p.add_argument("--fake-llm", action="store_true", help="offline stub: no API calls, no cost")
-    p.add_argument("--fresh", action="store_true", help="clear persisted memory before running")
-    p.add_argument("--no-persist", action="store_true", help="keep all memory in RAM only")
+    p.add_argument("--state-from", default=EMPTY,
+                   help="named state snapshot to start from (memory, blackboard, files); "
+                        f"default '{EMPTY}'. Nothing carries over between runs otherwise.")
+    p.add_argument("--state-save", default=None,
+                   help="save this run's end state as a new named snapshot")
+    p.add_argument("--run-id", default=None, help="output directory name under runs/")
     p.add_argument("--quiet", action="store_true")
     p.add_argument("--manifest", action="store_true",
                    help="print pinned versions, models and code hash, then exit")
@@ -58,28 +62,25 @@ async def main():
     CFG.model = args.model
     CFG.fake_llm = CFG.fake_llm or args.fake_llm
     CFG.ensure_dirs()
+    started = time.time()
+    # fail before spending anything, not after the run
+    if args.state_save and (args.state_save == EMPTY or snapshot_path(args.state_save).exists()):
+        raise SnapshotError(f"cannot save state as {args.state_save!r}: reserved or already exists")
 
-    if args.fresh:
-        shutil.rmtree(CFG.state_dir, ignore_errors=True)
-        CFG.state_dir.mkdir(parents=True, exist_ok=True)
-        print("[run] cleared persisted memory")
-
-    persist = not args.no_persist
-    llm = LLMClient(CFG)
+    client = LLMClient(CFG)
     specs = build_team(args.agents)
+    run = RunContext(client, [s.name for s in specs], state_from=args.state_from)
     adj = topology.build_adjacency(args.topology, len(specs), args.sparsity,
                                    args.seed, args.directed)
 
     print(f"\nmodel      : {CFG.model}{'  (FAKE)' if CFG.fake_llm else ''}")
     print(f"topology   : {args.topology}  |  schedule: {args.schedule}")
+    print(f"state from : {args.state_from}")
     print(f"roster     : {', '.join(f'{i}:{s.name}' for i, s in enumerate(specs))}")
     print(topology.describe(adj))
     print(f"\ntask: {args.task}\n")
 
-    graph = AgentGraph(specs, adj, llm, persist=persist)
-    if args.fresh:
-        graph.blackboard.reset()
-
+    graph = AgentGraph(specs, adj, run)
     await graph.run(args.task, rounds=args.rounds, schedule=args.schedule,
                     verbose=not args.quiet)
 
@@ -87,12 +88,15 @@ async def main():
     final = await graph.synthesize(args.task)
     print(final)
 
-    path = graph.save(args.task, final)
+    run_dir = graph.save(args.run_id, started=started)
+    if args.state_save:
+        print(f"state saved     : {run.save_snapshot(args.state_save)}")
     print(f"\nblackboard keys : {sorted(graph.blackboard.data)}")
+    print(f"files           : {sorted(run.files)}")
     print(f"tool calls      : "
           + ", ".join(f"{a.name}={len(a.tool_log)}" for a in graph.agents))
-    print(f"usage           : {llm.usage}")
-    print(f"transcript      : {path}")
+    print(f"usage           : {run.usage}")
+    print(f"run record      : {run_dir}")
 
 
 if __name__ == "__main__":

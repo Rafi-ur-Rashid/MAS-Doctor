@@ -69,6 +69,6 @@ def test_manifest():
 
 
 def test_fake_llm_smoke(tmp_path):
-    r = _run("--fake-llm", "--no-persist", "--quiet", env_extra={"MAS_RUNS_DIR": str(tmp_path)})
+    r = _run("--fake-llm", "--quiet", env_extra={"MAS_RUNS_DIR": str(tmp_path)})
     assert r.returncode == 0, r.stderr[-2000:]
-    assert list(tmp_path.glob("run_*.json")), "no transcript written"
+    assert list(tmp_path.glob("run_*/transcript.json")), "no transcript written"
