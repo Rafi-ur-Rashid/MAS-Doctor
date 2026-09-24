@@ -1,0 +1,10 @@
+__pycache__/
+.pytest_cache/
+# run outputs and mutable state: regenerated, never versioned
+runs/
+state/
+workspace/
+cache/
+results/
+*.sqlite
+*.sqlite3

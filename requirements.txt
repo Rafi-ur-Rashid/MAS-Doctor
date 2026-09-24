@@ -1,0 +1,11 @@
+# Direct dependencies of the mastrust env. Exact transitive pins: env/mastrust.lock.txt
+# Rebuild both envs: env/setup_envs.sh
+agentdojo==0.1.35
+numpy==2.5.3
+openai==3.19.2
+pytest==9.1.1
+PyYAML==6.0.3
+scikit-learn==1.9.1
+sentence-transformers==6.1.0
+torch==2.14.0
+transformers==5.17.0
