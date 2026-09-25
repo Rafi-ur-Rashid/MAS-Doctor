@@ -13,6 +13,7 @@ import argparse
 import asyncio
 import time
 
+from cache import MODES
 from config import CFG
 import topology
 from llm import LLMClient
@@ -46,6 +47,16 @@ def parse_args():
     p.add_argument("--state-save", default=None,
                    help="save this run's end state as a new named snapshot")
     p.add_argument("--run-id", default=None, help="output directory name under runs/")
+    p.add_argument("--cache", default=CFG.cache_mode, choices=MODES,
+                   help="replay-or-record: reuse stored responses, record new ones (default); "
+                        "replay-strict: stored responses only, never call the API; "
+                        "off: no cache, run cannot be replayed")
+    p.add_argument("--replica", type=int, default=0,
+                   help="sample afresh under this replica index (0 = the base recording)")
+    p.add_argument("--replica-from-call", type=int, default=0,
+                   help="chat calls before this index reuse replica 0; from it on, --replica")
+    p.add_argument("--budget", type=float, default=CFG.budget_usd,
+                   help="stop making API calls once spend (upper bound, USD) reaches this")
     p.add_argument("--quiet", action="store_true")
     p.add_argument("--manifest", action="store_true",
                    help="print pinned versions, models and code hash, then exit")
@@ -61,6 +72,7 @@ async def main():
         return
     CFG.model = args.model
     CFG.fake_llm = CFG.fake_llm or args.fake_llm
+    CFG.budget_usd = args.budget
     CFG.ensure_dirs()
     started = time.time()
     # fail before spending anything, not after the run
@@ -69,13 +81,18 @@ async def main():
 
     client = LLMClient(CFG)
     specs = build_team(args.agents)
-    run = RunContext(client, [s.name for s in specs], state_from=args.state_from)
+    run = RunContext(client, [s.name for s in specs], state_from=args.state_from,
+                     cache_mode=args.cache, replica=args.replica,
+                     replica_from_call=args.replica_from_call)
     adj = topology.build_adjacency(args.topology, len(specs), args.sparsity,
                                    args.seed, args.directed)
 
     print(f"\nmodel      : {CFG.model}{'  (FAKE)' if CFG.fake_llm else ''}")
     print(f"topology   : {args.topology}  |  schedule: {args.schedule}")
     print(f"state from : {args.state_from}")
+    if not CFG.fake_llm:
+        print(f"cache      : {args.cache}  |  replica {args.replica} from call "
+              f"{args.replica_from_call}  |  budget ${CFG.budget_usd:.2f}")
     print(f"roster     : {', '.join(f'{i}:{s.name}' for i, s in enumerate(specs))}")
     print(topology.describe(adj))
     print(f"\ntask: {args.task}\n")
@@ -96,6 +113,13 @@ async def main():
     print(f"tool calls      : "
           + ", ".join(f"{a.name}={len(a.tool_log)}" for a in graph.agents))
     print(f"usage           : {run.usage}")
+    st = run.cache_stats
+    if not CFG.fake_llm:
+        print(f"cache           : {st.chat_hits} chat hits, {st.chat_misses} misses "
+              f"(first miss at call {st.first_miss_call}); {st.embed_hits} embed hits, "
+              f"{st.embed_misses} misses")
+        if st.truncated:
+            print(f"WARNING         : {st.truncated} response(s) hit max_completion_tokens")
     print(f"run record      : {run_dir}")
 
 

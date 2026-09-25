@@ -88,11 +88,34 @@ the same round, so a downstream role (the Writer) can have little to write in ro
 its neighbours already produced this round. Slower — no parallelism — but consumer roles
 actually have something to consume.
 
+## Record and replay (`cache.py`)
+
+gpt-5-mini cannot be made to repeat itself, so every model and embedding response is
+stored in `cache/llm_cache.sqlite` under a fingerprint of the exact request (model
+snapshot, messages, tools, sampling settings, replica). Running the same run again reuses
+the stored responses: same transcript, zero API calls, zero cost.
+
+```bash
+python run.py --run-id a                          # records (default: replay-or-record)
+python run.py --run-id b --cache replay-strict    # replays a; errors instead of calling the API
+python run.py --replica 1                         # a fresh sample of the same run
+python run.py --replica 1 --replica-from-call 12  # reuse calls 0-11, resample from call 12
+python run.py --budget 0.50                       # stop calling the API past $0.50 (upper bound)
+```
+
+For a paired run (clean vs. attacked), the attacked run reuses every stored response
+until the first request the attack changed. `meta.json` records that call's index as
+`cache.first_miss_call`, the divergence point. Replays need no API key. The spending cap
+counts only real API calls, at the list prices in `config.PRICES_PER_1M`, ignoring
+OpenAI's cached-input discount, so it overestimates spend. A model with no price there
+cannot make API calls.
+
 ## Output
 
 Each run writes `runs/<run_id>/transcript.json` and `runs/<run_id>/meta.json`.
 `transcript.json` contains no wall-clock time, so the same run from the same state gives a
-byte-identical file. `meta.json` holds timings, token usage and the manifest.
+byte-identical file. `meta.json` holds timings, token usage and cost, cache statistics,
+the transcript's SHA-256, and the manifest.
 The transcript contains the task, `adj_matrix`,
 `system_prompts`, and `communication_data` shaped as `[[[agent_idx, text], ...], ...]` —
 one list per round. That is deliberately XG-Guard's transcript schema, so these runs can

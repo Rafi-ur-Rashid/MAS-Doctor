@@ -1,38 +1,55 @@
 """Thin async wrapper around the OpenAI API: chat + embeddings, with retries,
-a concurrency cap, usage accounting, and an offline fake mode for plumbing tests."""
+a concurrency cap, record-replay caching (cache.py), a spending cap, usage
+accounting, and an offline fake mode for plumbing tests."""
 from __future__ import annotations
 
 import asyncio
 import hashlib
+import itertools
 import json
 import random
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from openai import AsyncOpenAI
+from openai.types.chat import ChatCompletion
 
-from config import CFG
+from cache import (MODES, BudgetExceeded, CacheMiss, CacheStats, ResponseCache,
+                   chat_cost_upper, chat_key, embed_cost_upper, embed_key, price_for)
+from config import CFG, PRICES_PER_1M
 
 
 @dataclass
 class Usage:
+    """Real API spend only. Responses served from the cache cost nothing and are
+    not counted here (CacheStats counts them)."""
     prompt_tokens: int = 0
+    cached_prompt_tokens: int = 0   # served from OpenAI's prompt cache (billed at a discount)
     completion_tokens: int = 0      # includes reasoning tokens, which are billed as output
     reasoning_tokens: int = 0
     calls: int = 0
     embed_calls: int = 0
+    embed_tokens: int = 0
+    cost_usd_upper: float = 0.0     # upper bound: see cache.chat_cost_upper
 
-    def add(self, u) -> None:
+    def add_chat(self, u, cost: float) -> None:
         self.calls += 1
+        self.cost_usd_upper += cost
         if u is not None:
-            self.prompt_tokens += getattr(u, "prompt_tokens", 0) or 0
-            self.completion_tokens += getattr(u, "completion_tokens", 0) or 0
-            details = getattr(u, "completion_tokens_details", None)
-            self.reasoning_tokens += getattr(details, "reasoning_tokens", 0) or 0
+            self.prompt_tokens += u.prompt_tokens or 0
+            self.completion_tokens += u.completion_tokens or 0
+            self.reasoning_tokens += getattr(u.completion_tokens_details, "reasoning_tokens", 0) or 0
+            self.cached_prompt_tokens += getattr(u.prompt_tokens_details, "cached_tokens", 0) or 0
+
+    def add_embed(self, u, cost: float) -> None:
+        self.embed_calls += 1
+        self.cost_usd_upper += cost
+        if u is not None:
+            self.embed_tokens += u.prompt_tokens or 0
 
     def __str__(self) -> str:
         return (f"{self.calls} chat calls, {self.embed_calls} embed calls, "
                 f"{self.prompt_tokens} prompt + {self.completion_tokens} completion tokens "
-                f"({self.reasoning_tokens} reasoning)")
+                f"({self.reasoning_tokens} reasoning), <= ${self.cost_usd_upper:.4f}")
 
 
 def is_reasoning_model(model: str) -> bool:
@@ -49,44 +66,89 @@ def sampling_params(cfg, model: str) -> dict:
 
 
 class LLMClient:
-    def __init__(self, cfg=CFG):
+    """Shared by every run in a process: one connection, one concurrency cap, one
+    budget. Runs talk to it through RunLLM views (for_run), which carry their own
+    usage, cache mode, replica and call counter."""
+
+    def __init__(self, cfg=CFG, cache: ResponseCache | None = None):
         self.cfg = cfg
-        self.usage = Usage()
+        self.usage = Usage()            # whole process: what the budget cap checks
         self._sem = asyncio.Semaphore(cfg.max_concurrency)
+        self._cache = cache
         self._client = None
         if not cfg.fake_llm:
-            if not cfg.api_key:
-                raise RuntimeError("OPENAI_API_KEY is not set (or run with --fake-llm)")
-            self._client = AsyncOpenAI(api_key=cfg.api_key, base_url=cfg.base_url)
+            # fail now, not mid-run, if the budget cap could not price a call
+            self._chat_price = price_for(PRICES_PER_1M, cfg.model)
+            self._embed_price = price_for(PRICES_PER_1M, cfg.embed_model)
+            if cfg.api_key:             # replay-strict needs no key
+                self._client = AsyncOpenAI(api_key=cfg.api_key, base_url=cfg.base_url)
+
+    @property
+    def cache(self) -> ResponseCache:
+        if self._cache is None:
+            self._cache = ResponseCache(self.cfg.cache_path)
+        return self._cache
+
+    def for_run(self, usage: Usage, stats: CacheStats | None = None, mode: str | None = None,
+                replica: int = 0, replica_from_call: int = 0) -> "RunLLM":
+        """A per-run view: shares the transport, cache and budget, but accounts usage
+        and cache stats to one run and numbers that run's chat calls."""
+        return RunLLM(self, usage, stats or CacheStats(), mode or self.cfg.cache_mode,
+                      replica, replica_from_call)
 
     # ------------------------------------------------------------------ chat
-    def for_run(self, usage: Usage) -> "RunLLM":
-        """A view of this client that also accounts usage to one run. The
-        transport (semaphore, retries) stays shared, so concurrent runs still
-        respect one process-wide concurrency cap."""
-        return RunLLM(self, usage)
-
     async def chat(self, messages: list[dict], tools: list[dict] | None = None,
-                   usage: Usage | None = None):
-        """Returns the raw assistant message object (may carry .tool_calls)."""
+                   usage: Usage | None = None, *, idx: int = 0, replica: int = 0,
+                   mode: str | None = None, stats: CacheStats | None = None):
+        """Returns the assistant message object (may carry .tool_calls)."""
         if self.cfg.fake_llm:
             return _FakeMessage(messages, tools)
+        mode = mode or self.cfg.cache_mode
+        if mode not in MODES:
+            raise ValueError(f"unknown cache mode {mode!r}; expected one of {MODES}")
+        stats = stats if stats is not None else CacheStats(mode=mode)
 
-        kwargs = dict(
-            model=self.cfg.model,
-            messages=messages,
-            **sampling_params(self.cfg, self.cfg.model),
-        )
+        request = dict(model=self.cfg.model, messages=messages,
+                       **sampling_params(self.cfg, self.cfg.model))
         if tools:
-            kwargs["tools"] = tools
-            kwargs["tool_choice"] = "auto"
+            request["tools"] = tools
+            request["tool_choice"] = "auto"
 
+        if mode == "off":
+            stats.chat_miss(idx)
+            data = await self._call_chat(request, usage)
+        else:
+            key = chat_key(request, replica)
+            data = self.cache.get(key)
+            if data is not None:
+                stats.chat_hit()
+            else:
+                stats.chat_miss(idx)
+                if mode == "replay-strict":
+                    raise CacheMiss(f"chat call {idx}: no stored response for key {key[:16]}... "
+                                    f"(replica {replica})")
+                fresh = await self._call_chat(request, usage)
+                # first write wins: if another process stored this request meanwhile,
+                # continue with its response so this run and its replay agree
+                data = self.cache.put(key, "chat", request, fresh)
+
+        # rebuilt from stored JSON on every path, so a recorded run and its replay
+        # hand the agent objects built the same way
+        choice = ChatCompletion.model_validate(data).choices[0]
+        if choice.finish_reason == "length":
+            stats.truncated += 1
+        return choice.message
+
+    async def _call_chat(self, request: dict, usage: Usage | None) -> dict:
+        client = self._require_client()
         async with self._sem:
-            resp = await self._with_retry(lambda: self._client.chat.completions.create(**kwargs))
+            self._check_budget()
+            resp = await self._with_retry(lambda: client.chat.completions.create(**request))
+        cost = chat_cost_upper(resp.usage, self._chat_price)
         for u in (self.usage, usage):
             if u is not None:
-                u.add(getattr(resp, "usage", None))
-        return resp.choices[0].message
+                u.add_chat(resp.usage, cost)
+        return resp.model_dump(mode="json")
 
     # ------------------------------------------------------------ embeddings
     @property
@@ -95,25 +157,73 @@ class LLMClient:
         spaces are not comparable, so state snapshots record and check this."""
         return f"hash-{_HASH_DIM}" if self.cfg.fake_llm else self.cfg.embed_model
 
-    async def embed(self, texts: list[str], usage: Usage | None = None) -> list[list[float]]:
+    async def embed(self, texts: list[str], usage: Usage | None = None, *,
+                    mode: str | None = None, stats: CacheStats | None = None) -> list[list[float]]:
         if self.cfg.fake_llm:
             return [_hash_embed(t) for t in texts]
+        mode = mode or self.cfg.cache_mode
+        if mode not in MODES:
+            raise ValueError(f"unknown cache mode {mode!r}; expected one of {MODES}")
+        stats = stats if stats is not None else CacheStats(mode=mode)
+        model = self.cfg.embed_model
+
+        if mode == "off":
+            stats.embed_misses += len(texts)
+            vecs, _ = await self._call_embed(texts, usage)
+            return vecs
+
+        keys = [embed_key(model, t) for t in texts]
+        out: list = [self.cache.get(k) for k in keys]
+        missing = [i for i, d in enumerate(out) if d is None]
+        stats.embed_hits += len(texts) - len(missing)
+        stats.embed_misses += len(missing)
+        if missing:
+            if mode == "replay-strict":
+                raise CacheMiss(f"embedding: no stored vector for {len(missing)} text(s)")
+            vecs, fallback = await self._call_embed([texts[i] for i in missing], usage)
+            for i, v in zip(missing, vecs):
+                # a hashed fallback vector must never enter the store
+                out[i] = {"embedding": v} if fallback else self.cache.put(
+                    keys[i], "embed", {"model": model, "input": texts[i]}, {"embedding": v})
+        return [d["embedding"] for d in out]
+
+    async def _call_embed(self, texts: list[str], usage: Usage | None):
+        """Returns (vectors, used_fallback)."""
         try:
+            client = self._require_client()
             async with self._sem:
+                self._check_budget()
                 resp = await self._with_retry(
-                    lambda: self._client.embeddings.create(model=self.cfg.embed_model, input=texts)
-                )
+                    lambda: client.embeddings.create(model=self.cfg.embed_model, input=texts))
+        except BudgetExceeded:
+            raise
         except Exception as e:
             # Hashed vectors live in a different space from real ones, so a silent
             # fallback would quietly change what retrieval returns mid-experiment.
             if not self.cfg.embed_fallback:
                 raise RuntimeError(f"embedding failed and embed_fallback is off: {e}") from e
             print(f"[llm] embedding failed ({e}); falling back to hashed embeddings")
-            return [_hash_embed(t) for t in texts]
+            return [_hash_embed(t) for t in texts], True
+        cost = embed_cost_upper(resp.usage, self._embed_price)
         for u in (self.usage, usage):
             if u is not None:
-                u.embed_calls += 1
-        return [d.embedding for d in resp.data]
+                u.add_embed(resp.usage, cost)
+        return [d.embedding for d in resp.data], False
+
+    # ------------------------------------------------------------- guards
+    def _require_client(self):
+        if self._client is None:
+            raise RuntimeError("OPENAI_API_KEY is not set: only replay-strict runs (or "
+                               "--fake-llm) work without it")
+        return self._client
+
+    def _check_budget(self) -> None:
+        """Checked inside the concurrency slot, right before each API call. Calls
+        already in flight still finish, so spend can pass the cap by at most
+        max_concurrency calls."""
+        if self.usage.cost_usd_upper >= self.cfg.budget_usd:
+            raise BudgetExceeded(f"spent <= ${self.usage.cost_usd_upper:.4f} (upper bound), "
+                                 f"cap ${self.cfg.budget_usd:.2f}; no further API calls")
 
     # ----------------------------------------------------------------- retry
     async def _with_retry(self, thunk):
@@ -132,21 +242,34 @@ class LLMClient:
 
 
 class RunLLM:
-    """Per-run view of a shared LLMClient: same transport, separate usage."""
+    """Per-run view of a shared LLMClient: same transport, cache and budget;
+    separate usage, cache stats, cache mode and replica."""
 
-    def __init__(self, client: LLMClient, usage: Usage):
-        self.client = client
-        self.usage = usage
+    def __init__(self, client: LLMClient, usage: Usage, stats: CacheStats, mode: str,
+                 replica: int, replica_from_call: int):
+        if mode not in MODES:
+            raise ValueError(f"unknown cache mode {mode!r}; expected one of {MODES}")
+        if replica < 0 or replica_from_call < 0:
+            raise ValueError("replica and replica_from_call must be >= 0")
+        self.client, self.usage, self.stats = client, usage, stats
+        self.mode, self.replica, self.replica_from_call = mode, replica, replica_from_call
+        stats.mode, stats.replica, stats.replica_from_call = mode, replica, replica_from_call
+        self._calls = itertools.count()
 
     @property
     def embed_space(self) -> str:
         return self.client.embed_space
 
     async def chat(self, messages: list[dict], tools: list[dict] | None = None):
-        return await self.client.chat(messages, tools, usage=self.usage)
+        # Numbered before the first await, so concurrent agents started in index
+        # order (asyncio.gather) always get the same numbers.
+        idx = next(self._calls)
+        replica = self.replica if idx >= self.replica_from_call else 0
+        return await self.client.chat(messages, tools, usage=self.usage, idx=idx,
+                                      replica=replica, mode=self.mode, stats=self.stats)
 
     async def embed(self, texts: list[str]) -> list[list[float]]:
-        return await self.client.embed(texts, usage=self.usage)
+        return await self.client.embed(texts, usage=self.usage, mode=self.mode, stats=self.stats)
 
 
 # --------------------------------------------------------------------- utils

@@ -7,7 +7,12 @@ state is saved only if the caller asks for it, under a new name, and existing
 snapshots are never overwritten. So nothing carries over between runs
 implicitly, and any run can be repeated from the exact state it started from.
 
-The event log (C04) and the LLM cache namespace (C03) will also live here.
+It also carries the run's cache settings (C03): the cache mode, and the replica
+index with the call it takes effect from. Calls numbered below replica_from_call
+reuse the base recording (replica 0); calls from there on are sampled afresh
+under the given replica. CacheStats records which calls were served from the
+store and where the run first diverged from it. The event log (C04) will also
+live here.
 """
 from __future__ import annotations
 
@@ -17,6 +22,7 @@ import re
 from dataclasses import asdict
 from pathlib import Path
 
+from cache import CacheStats
 from config import CFG
 from llm import Usage
 from memory import Blackboard, MemoryItem, VectorStore
@@ -38,13 +44,17 @@ def snapshot_path(name: str, state_dir: Path | None = None) -> Path:
 
 class RunContext:
     def __init__(self, client, agent_names: list[str], state_from: str = EMPTY,
-                 state_dir: Path | None = None):
-        """client: a shared LLMClient (or any object with for_run(usage)).
+                 state_dir: Path | None = None, cache_mode: str | None = None,
+                 replica: int = 0, replica_from_call: int = 0):
+        """client: a shared LLMClient (or any object with the same for_run).
         agent_names: the roster; episodic stores are keyed by agent name."""
         self.state_dir = state_dir or CFG.state_dir
         self.state_from = state_from
         self.usage = Usage()
-        self.llm = client.for_run(self.usage)
+        self.cache_stats = CacheStats()
+        self.llm = client.for_run(self.usage, stats=self.cache_stats,
+                                  mode=cache_mode or CFG.cache_mode,
+                                  replica=replica, replica_from_call=replica_from_call)
 
         snap = self._load(state_from)
         unknown = sorted(set(snap["agents"]) - set(agent_names))

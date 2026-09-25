@@ -2,13 +2,16 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import time
+from dataclasses import asdict
 from pathlib import Path
 
 import numpy as np
 
 from agent import Agent, AgentSpec
+from cache import KEY_VERSION
 from config import CFG
 
 
@@ -168,6 +171,12 @@ class AgentGraph:
         run_dir.mkdir(parents=True, exist_ok=False)
         (run_dir / "transcript.json").write_text(json.dumps(self.transcript(), indent=2))
         meta = {"run_id": run_id, "started": started, "finished": time.time(),
-                "usage": vars(self.ctx.usage), "manifest": build_manifest()}
+                "usage": vars(self.ctx.usage),
+                "cache": {**asdict(self.ctx.cache_stats), "path": str(CFG.cache_path),
+                          "key_version": KEY_VERSION},
+                "budget_usd": CFG.budget_usd,
+                "transcript_sha256": hashlib.sha256(
+                    (run_dir / "transcript.json").read_bytes()).hexdigest(),
+                "manifest": build_manifest()}
         (run_dir / "meta.json").write_text(json.dumps(meta, indent=2))
         return run_dir

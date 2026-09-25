@@ -341,7 +341,7 @@ Total is about $400–600 for C01–C23 and C25 at the gpt-5-mini prices in §8,
 **C03 · Record–replay cache.**
 - Build:
   - A SQLite cache for chat and embedding calls, keyed on `sha256(model_snapshot, messages, tools, sampling_params, replica_idx)`.
-  - Modes: `record`, `replay-strict` (a miss raises an error), `replay-or-record`.
+  - Modes: `replay-or-record` (default), `replay-strict` (a miss raises an error and nothing is sent to the API), and `off` (demos only; the run cannot be replayed). (Changed at C03: there is no record-only mode. Re-recording a request that is already stored would either overwrite the response earlier runs used, which breaks their replay, or behave exactly like `replay-or-record`. Fresh samples come from a new replica id instead.)
   - `replica_from_call=d` switches to a new replica id from call d onward; E4a's null intervention needs it.
   - Run metadata stores hits, misses and the index of the first miss (the divergence point).
   - Per-invocation dollar cap, computed from the existing usage accounting.

@@ -51,7 +51,7 @@ class ScriptedClient:
         self.always_tools = always_tools
         self.prompts: list[list[dict]] = []
 
-    def for_run(self, usage: Usage):
+    def for_run(self, usage: Usage, **cache_settings):   # cache settings unused offline
         return _ScriptedRun(self, usage)
 
 
@@ -253,7 +253,7 @@ def test_workspace_paths_cannot_escape(path):
     assert "error" in out and ctx.files == {}
 
 
-def test_embedding_failure_is_loud_unless_fallback_is_on():
+def test_embedding_failure_is_loud_unless_fallback_is_on(tmp_path):
     class _Boom:
         class embeddings:
             @staticmethod
@@ -261,10 +261,13 @@ def test_embedding_failure_is_loud_unless_fallback_is_on():
                 raise ConnectionError("network down")
 
     def client(fallback):
-        c = LLMClient(Config(api_key="unused", fake_llm=False, max_retries=1, embed_fallback=fallback))
+        c = LLMClient(Config(api_key="unused", fake_llm=False, max_retries=1,
+                             embed_fallback=fallback, cache_path=tmp_path / "c.sqlite"))
         c._client = _Boom()
         return c
 
     with pytest.raises(RuntimeError, match="embed_fallback is off"):
         asyncio.run(client(False).embed(["hello"]))
-    assert len(asyncio.run(client(True).embed(["hello"]))[0]) == 256
+    c = client(True)
+    assert len(asyncio.run(c.embed(["hello"]))[0]) == 256
+    assert len(c.cache) == 0            # a fallback vector must never be stored

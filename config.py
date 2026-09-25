@@ -5,6 +5,17 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 
+# USD per 1M tokens, used only for the budget cap and cost reports. List prices as
+# known on 2026-09-25 -- VERIFY against the OpenAI pricing page / billing before
+# relying on the numbers. The cap uses an upper bound (no cached-input discount), so
+# a small error here makes it stricter, not looser. A model missing from this table
+# cannot make API calls.
+PRICES_PER_1M = {
+    "gpt-5-mini-2025-08-07":  {"input": 0.25, "output": 2.00},
+    "gpt-4o-mini-2024-07-18": {"input": 0.15, "output": 0.60},
+    "text-embedding-3-small": {"input": 0.02},
+}
+
 
 @dataclass
 class Config:
@@ -32,6 +43,11 @@ class Config:
     agentdojo_benchmark: str = "v1.2.2"
     agentdojo_suite: str = "workspace"
     xgguard_dir: Path = Path(os.getenv("XGGUARD_DIR", "/scratch/mur5028/XG-Guard"))
+
+    # --- record-replay cache and spending cap (cache.py) ---
+    cache_path: Path = Path(os.getenv("MAS_CACHE_PATH", ROOT / "cache" / "llm_cache.sqlite"))
+    cache_mode: str = os.getenv("MAS_CACHE_MODE", "replay-or-record")
+    budget_usd: float = float(os.getenv("MAS_BUDGET_USD", "1.00"))   # per process, upper-bound cost
 
     # --- orchestration ---
     max_tool_iters: int = 5      # tool-calling loop depth per agent turn
