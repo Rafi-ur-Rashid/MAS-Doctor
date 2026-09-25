@@ -58,6 +58,7 @@ class ScriptedClient:
 class _ScriptedRun:
     def __init__(self, client, usage):
         self.client, self.usage = client, usage
+        self.calls = 0
 
     @property
     def embed_space(self):
@@ -67,8 +68,11 @@ class _ScriptedRun:
         await asyncio.sleep(self.client.rng.random() * self.client.max_delay)
         return [_hash_embed(t) for t in texts]
 
-    async def chat(self, messages, tools=None):
+    async def chat(self, messages, tools=None, info=None):
         c = self.client
+        if info is not None:                 # numbered before the first await, like RunLLM
+            info.update(idx=self.calls, replica=0, cache_key=None, cache_hit=None)
+        self.calls += 1
         c.prompts.append(json.loads(json.dumps(messages)))
         await asyncio.sleep(c.rng.random() * c.max_delay)
         m = re.match(r"You are agent_(\d+) \(([^)]+)\)", messages[0]["content"])

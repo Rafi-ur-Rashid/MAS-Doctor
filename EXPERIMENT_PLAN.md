@@ -356,6 +356,12 @@ Total is about $400–600 for C01–C23 and C25 at the gpt-5-mini prices in §8,
 - Check:
   - (a) Replaying the C03 run in strict mode has 0 misses, which proves the instrumentation did not change any prompt.
   - (b) Rebuilding every `llm_call`'s messages from its artifact ids equals what was actually sent.
+- As built (C04):
+  - Messages are stored as recipes: runtime literal text plus references to artifacts. Model-, tool- and memory-authored text only ever appears as a reference, and a test enforces this.
+  - Added `response` artifacts (R_i, what neighbours receive), `msg_send` and `msg_recv`, and the moderator's call.
+  - Tool results list the artifact ids the tool read and wrote.
+  - Snapshot format 2 carries memory write ids and a generation number, so ids of persisted content never collide along a chain of runs.
+  - Check (b) is also run against the cache: each request rebuilt from the log has the recorded cache key, and that key is in the store.
 
 **C05 · E0 — XG-Guard reproduction (gate G3).**
 - Build, in env `xgguard`:

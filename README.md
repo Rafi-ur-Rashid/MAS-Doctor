@@ -18,6 +18,8 @@ LangGraph/AutoGen abstraction, so every prompt and every message hop is inspecta
 | `memory.py`   | working / episodic (vector) / shared blackboard |
 | `run_context.py` | one run's mutable state + named state snapshots |
 | `manifest.py` | versions, models and code hash for every run record |
+| `cache.py`    | record-replay store for model responses; budget cost bounds |
+| `events.py`   | event log: artifacts, recipes, events, and the verifier |
 | `agent.py`    | one agent: persona, tool subset, tool-calling loop |
 | `topology.py` | chain, ring, star, tree, complete, random |
 | `graph.py`    | round-based message passing + synthesis + transcript |
@@ -110,9 +112,40 @@ counts only real API calls, at the list prices in `config.PRICES_PER_1M`, ignori
 OpenAI's cached-input discount, so it overestimates spend. A model with no price there
 cannot make API calls.
 
+## Event log (`events.py`)
+
+Each run also writes `runs/<run_id>/events.jsonl`: one record per line, either an
+**artifact** (a piece of content with an id) or an **event** (something that happened).
+
+| Artifact id | What it is |
+|---|---|
+| `task` | the user task |
+| `sys:<agent>` | an agent's system prompt |
+| `m:<agent>:<n>` | the n-th message in an agent's context, stored as a *recipe* |
+| `out:<call>` | a model output (text and tool calls) |
+| `tr:<call>.<k>` | the result of the k-th tool call in that output |
+| `resp:<agent>:<round>` | an agent's final response in a round (what neighbours receive) |
+| `w<seq>` | an episodic memory item (its write id) |
+| `bb<seq>` | a blackboard value; the moderator's prompt also references its `key` field |
+| `file:g<gen>:<call>.<k>` | a workspace file version (`gen` = snapshot generation) |
+| `final` | the moderator's synthesis |
+
+Events: `run_start`, `prompt_delivery` (registered vs delivered prompt hash), `llm_call`
+(the message ids that formed the context, a hash of what was sent, the cache key, the
+output id), `tool_dispatch`, `tool_result` (result id plus the artifact ids the tool read
+and wrote), `mem_read` (candidates, returned write ids, similarities, top-1/top-2 margin),
+`mem_write`, `msg_send`, `msg_recv`.
+
+A recipe is a list of parts: runtime-written literal text, or a reference to an artifact.
+So the log shows exactly which pieces went into every prompt and which text the runtime
+itself wrote; model-, tool- and memory-authored text only ever appears as a reference.
+`python events.py runs/<run_id>` rebuilds every prompt from the recipes, checks it against
+the hash of what was sent, rebuilds each request's cache key, and checks the key is in the
+store. The same run yields a byte-identical log.
+
 ## Output
 
-Each run writes `runs/<run_id>/transcript.json` and `runs/<run_id>/meta.json`.
+Each run writes `runs/<run_id>/transcript.json`, `events.jsonl` (above) and `meta.json`.
 `transcript.json` contains no wall-clock time, so the same run from the same state gives a
 byte-identical file. `meta.json` holds timings, token usage and cost, cache statistics,
 the transcript's SHA-256, and the manifest.

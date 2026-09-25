@@ -11,8 +11,11 @@ It also carries the run's cache settings (C03): the cache mode, and the replica
 index with the call it takes effect from. Calls numbered below replica_from_call
 reuse the base recording (replica 0); calls from there on are sampled afresh
 under the given replica. CacheStats records which calls were served from the
-store and where the run first diverged from it. The event log (C04) will also
-live here.
+store and where the run first diverged from it.
+
+The run's event log (C04, events.py) lives here too. State loaded from a snapshot
+is registered in it first, as artifacts with producer "snapshot", so every later
+reference to a loaded memory item, blackboard value or file resolves.
 """
 from __future__ import annotations
 
@@ -24,11 +27,12 @@ from pathlib import Path
 
 from cache import CacheStats
 from config import CFG
+from events import EventLog, artifact
 from llm import Usage
 from memory import Blackboard, MemoryItem, VectorStore
 
 EMPTY = "empty"
-SNAPSHOT_FORMAT = 1
+SNAPSHOT_FORMAT = 2   # 2: memory items carry write_id; files carry artifact ids
 _NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 
 
@@ -66,15 +70,31 @@ class RunContext:
                                 f"{snap['embed_space']!r}, this run uses {self.llm.embed_space!r}")
         # continue the logical clock after whatever the snapshot already holds
         self._seq = itertools.count(snap["next_seq"])
+        # a run started from a snapshot of generation g is generation g + 1; ids of
+        # content that persists across runs (files) include it, so a chain of runs
+        # through snapshots never reuses an id
+        self.generation = snap["generation"] + 1
 
         self.blackboard = Blackboard(self.clock, snap["blackboard"]["data"],
                                      snap["blackboard"]["log"])
         self.files: dict[str, str] = dict(snap["files"])
+        self.file_ids: dict[str, str] = dict(snap["file_ids"])
         self.stores: dict[str, VectorStore] = {
             name: VectorStore(self.llm, self.clock,
                               [MemoryItem(**d) for d in snap["agents"].get(name, [])])
             for name in agent_names
         }
+
+        self.events = EventLog()
+        for name, store in self.stores.items():
+            for it in store.items:
+                self.events.emit(artifact(it.write_id, "memory_item", "snapshot", it.text,
+                                          owner=name, meta=it.meta))
+        for key, value in self.blackboard.data.items():
+            self.events.emit(artifact(self.blackboard.ids[key], "blackboard_value", "snapshot",
+                                      value, key=key))
+        for path, content in self.files.items():
+            self.events.emit(artifact(self.file_ids[path], "file", "snapshot", content, path=path))
 
     # ------------------------------------------------------------ clock
     def clock(self) -> int:
@@ -84,8 +104,9 @@ class RunContext:
     # -------------------------------------------------------- snapshots
     def _load(self, name: str) -> dict:
         if name == EMPTY:
-            return {"format": SNAPSHOT_FORMAT, "embed_space": None, "next_seq": 1,
-                    "agents": {}, "blackboard": {"data": {}, "log": []}, "files": {}}
+            return {"format": SNAPSHOT_FORMAT, "embed_space": None, "next_seq": 1, "generation": 0,
+                    "agents": {}, "blackboard": {"data": {}, "log": []}, "files": {},
+                    "file_ids": {}}
         path = snapshot_path(name, self.state_dir)
         if not path.exists():
             raise SnapshotError(f"no state snapshot named {name!r} ({path})")
@@ -103,9 +124,11 @@ class RunContext:
             "format": SNAPSHOT_FORMAT,
             "embed_space": self.llm.embed_space,
             "next_seq": last,
+            "generation": self.generation,
             "agents": {n: [asdict(it) for it in s.items] for n, s in self.stores.items()},
             "blackboard": {"data": self.blackboard.data, "log": self.blackboard.log},
             "files": self.files,
+            "file_ids": self.file_ids,
         }
 
     def save_snapshot(self, name: str) -> Path:

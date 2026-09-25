@@ -13,6 +13,8 @@ import numpy as np
 from agent import Agent, AgentSpec
 from cache import KEY_VERSION
 from config import CFG
+from events import SCHEMA_VERSION, Composite, artifact, event, message_artifact, sha256
+from llm import sampling_params
 
 
 class AgentGraph:
@@ -35,27 +37,44 @@ class AgentGraph:
         self.schedule: str | None = None
 
     # ------------------------------------------------------------ prompting
-    def _initial_prompt(self, task: str) -> str:
-        return (f"TASK: {task}\n\n"
-                f"This is round 0. Work the task from your own role using your tools, "
-                f"then give your position. Share key findings via blackboard_write.")
+    # Prompts are built as Composites: the text the model sees plus its recipe,
+    # which records which parts the runtime wrote and which came from artifacts.
+    def _initial_prompt(self, task: str) -> Composite:
+        return (Composite().text("TASK: ").ref("task", task)
+                .text("\n\nThis is round 0. Work the task from your own role using your tools, "
+                      "then give your position. Share key findings via blackboard_write."))
 
-    def _round_prompt(self, idx: int, task: str, round_idx: int) -> str:
+    def _round_prompt(self, idx: int, task: str, round_idx: int) -> Composite:
         in_idxs = np.nonzero(self.adj[:, idx])[0]
+        digest = Composite()
         if len(in_idxs) == 0:
-            digest = "No other agent is connected to you this round.\n"
+            digest.text("No other agent is connected to you this round.\n")
         else:
-            parts = []
             for src in in_idxs:
                 peer = self.agents[src]
                 if peer.last_response:
-                    parts.append(f"--- agent_{src} ({peer.name}) said ---\n{peer.last_response}")
-            digest = "\n\n".join(parts) or "Your neighbours produced nothing this round.\n"
-        return (f"TASK (unchanged): {task}\n\n"
-                f"Round {round_idx}. Messages from the agents connected to you:\n\n{digest}\n\n"
-                f"Weigh their input against your own evidence. Verify with tools rather than "
-                f"deferring on trust. Then give your updated position, and say plainly if you "
-                f"changed your mind and why.")
+                    if digest.parts:
+                        digest.text("\n\n")
+                    digest.text(f"--- agent_{src} ({peer.name}) said ---\n")
+                    digest.ref(peer.last_response_id, peer.last_response)
+                    self.ctx.events.emit(event("msg_recv", round=round_idx, to=self.agents[idx].name,
+                                               to_idx=idx, sender=peer.name, sender_idx=int(src),
+                                               response=peer.last_response_id))
+            if not digest.parts:
+                digest.text("Your neighbours produced nothing this round.\n")
+        return (Composite().text("TASK (unchanged): ").ref("task", task)
+                .text(f"\n\nRound {round_idx}. Messages from the agents connected to you:\n\n")
+                .extend(digest)
+                .text("\n\nWeigh their input against your own evidence. Verify with tools rather than "
+                      "deferring on trust. Then give your updated position, and say plainly if you "
+                      "changed your mind and why."))
+
+    def _sent(self, i: int, round_idx: int) -> None:
+        """Log agent i's response as sent to its out-neighbours (adj[i][j] == 1)."""
+        a = self.agents[i]
+        self.ctx.events.emit(event("msg_send", round=round_idx, sender=a.name, sender_idx=i,
+                                   response=a.last_response_id,
+                                   to=[int(j) for j in np.nonzero(self.adj[i, :])[0]]))
 
     # ----------------------------------------------------------------- runs
     async def run(self, task: str, rounds: int = 2, schedule: str = "parallel",
@@ -75,6 +94,14 @@ class AgentGraph:
             raise ValueError(f"unknown schedule '{schedule}' (parallel|sequential)")
         self.task, self.schedule = task, schedule
         self.communication_data = []
+        ev = self.ctx.events
+        ev.emit(event("run_start", schema=SCHEMA_VERSION, model=CFG.model,
+                      sampling=sampling_params(CFG, CFG.model), schedule=schedule,
+                      rounds=rounds, adj=self.adj.tolist(),
+                      agents=[a.name for a in self.agents], state_from=self.ctx.state_from,
+                      replica=self.ctx.llm.replica if hasattr(self.ctx.llm, "replica") else 0,
+                      replica_from_call=getattr(self.ctx.llm, "replica_from_call", 0)))
+        ev.emit(artifact("task", "user_task", "user", task))
 
         if verbose:
             print(f"\n=== round 0: independent work "
@@ -100,21 +127,36 @@ class AgentGraph:
             return self._round_prompt(i, task, round_idx)
 
         if schedule == "sequential":
-            return [await self.agents[i].act(prompt_for(i), round_idx) for i in range(n)]
+            out = []
+            for i in range(n):
+                out.append(await self.agents[i].act(prompt_for(i), round_idx))
+                self._sent(i, round_idx)
+            return out
 
         # parallel, in lockstep. Snapshot every prompt first, so nobody reads a
-        # peer's fresh reply.
+        # peer's fresh reply. After each concurrent phase, event buffers are
+        # flushed in agent order, so the log does not depend on API latency.
         turns = [self.agents[i].turn(prompt_for(i), round_idx) for i in range(n)]
         await asyncio.gather(*(t.begin() for t in turns))          # private memory only
+        for t in turns:
+            t.flush()
         active = turns
         while active:
             await asyncio.gather(*(t.think() for t in active))     # LLM calls, concurrent
+            for t in active:
+                t.flush()
             for t in active:                                       # shared state, in order
                 await t.execute_tools()
+                t.flush()
             active = [t for t in active if not t.done]
         # in order: storing a memory ticks the run clock, so its order must not
         # depend on which embedding call returns first
-        return [await t.finish() for t in turns]
+        out = []
+        for i, t in enumerate(turns):
+            out.append(await t.finish())
+            t.flush()
+            self._sent(i, round_idx)
+        return out
 
     def _record(self, responses: list[str], verbose: bool) -> None:
         self.communication_data.append([[i, t] for i, t in enumerate(responses)])
@@ -123,21 +165,46 @@ class AgentGraph:
                 head = " ".join((text or "").split())[:150]
                 print(f"  agent_{i} ({self.agents[i].name}): {head}...")
 
-    async def synthesize(self, task: str) -> str:
-        board = self.blackboard.data
-        positions = "\n\n".join(
-            f"agent_{a.idx} ({a.name}, {a.spec.role}):\n{a.last_response}" for a in self.agents)
-        shared = "\n".join(f"- {k}: {v}" for k, v in board.items()) or "(empty)"
-        messages = [
-            {"role": "system",
-             "content": "You are the moderator of a multi-agent team. Merge the agents' final "
+    MODERATOR_PROMPT = ("You are the moderator of a multi-agent team. Merge the agents' final "
                         "positions into one answer. Note where they agree, resolve disagreements "
-                        "by weighing the evidence each cites, and flag anything still unresolved."},
-            {"role": "user",
-             "content": f"TASK: {task}\n\nSHARED BLACKBOARD:\n{shared}\n\nFINAL POSITIONS:\n{positions}"},
-        ]
-        msg = await self.llm.chat(messages)
+                        "by weighing the evidence each cites, and flag anything still unresolved.")
+
+    async def synthesize(self, task: str) -> str:
+        ev, bb = self.ctx.events, self.blackboard
+        user = Composite().text("TASK: ").ref("task", task).text("\n\nSHARED BLACKBOARD:\n")
+        if bb.data:
+            for n, (k, v) in enumerate(bb.data.items()):
+                if n:
+                    user.text("\n")
+                # the key is agent-written too, so it is a reference, not runtime text
+                user.text("- ").ref(bb.ids[k], k, field="key").text(": ").ref(bb.ids[k], v)
+        else:
+            user.text("(empty)")
+        user.text("\n\nFINAL POSITIONS:\n")
+        for n, a in enumerate(self.agents):
+            if n:
+                user.text("\n\n")
+            user.text(f"agent_{a.idx} ({a.name}, {a.spec.role}):\n")
+            if a.last_response_id is not None:
+                user.ref(a.last_response_id, a.last_response)
+        messages = [{"role": "system", "content": self.MODERATOR_PROMPT},
+                    {"role": "user", "content": user.content}]
+        ids = ["m:mod:0", "m:mod:1"]
+        ev.emit(message_artifact(ids[0], "runtime", "system", [{"text": self.MODERATOR_PROMPT}], {}))
+        ev.emit(message_artifact(ids[1], "runtime", "user", user.parts, {}))
+
+        info: dict = {}
+        msg = await self.llm.chat(messages, info=info)
+        out_id = f"out:{info['idx']}"
+        ev.emit(artifact(out_id, "llm_output", "moderator", msg.content, tool_calls=None))
+        ev.emit(event("llm_call", call_idx=info["idx"], agent="moderator", agent_idx=None,
+                      round=None, step=1, context=ids, tools=[],
+                      messages_sha256=sha256(messages), cache_key=info.get("cache_key"),
+                      cache_hit=info.get("cache_hit"), replica=info.get("replica"),
+                      output=out_id))
         self.final_answer = msg.content or ""
+        ev.emit(artifact("final", "final_answer", "moderator", self.final_answer,
+                         derived_from=[out_id]))
         return self.final_answer
 
     # ------------------------------------------------------------ transcript
@@ -170,6 +237,7 @@ class AgentGraph:
         run_dir = (out_dir or CFG.runs_dir) / run_id
         run_dir.mkdir(parents=True, exist_ok=False)
         (run_dir / "transcript.json").write_text(json.dumps(self.transcript(), indent=2))
+        self.ctx.events.write(run_dir / "events.jsonl")
         meta = {"run_id": run_id, "started": started, "finished": time.time(),
                 "usage": vars(self.ctx.usage),
                 "cache": {**asdict(self.ctx.cache_stats), "path": str(CFG.cache_path),
@@ -177,6 +245,9 @@ class AgentGraph:
                 "budget_usd": CFG.budget_usd,
                 "transcript_sha256": hashlib.sha256(
                     (run_dir / "transcript.json").read_bytes()).hexdigest(),
+                "events": {"schema": SCHEMA_VERSION, "records": len(self.ctx.events.records),
+                           "sha256": hashlib.sha256(
+                               (run_dir / "events.jsonl").read_bytes()).hexdigest()},
                 "manifest": build_manifest()}
         (run_dir / "meta.json").write_text(json.dumps(meta, indent=2))
         return run_dir

@@ -99,9 +99,13 @@ class LLMClient:
     # ------------------------------------------------------------------ chat
     async def chat(self, messages: list[dict], tools: list[dict] | None = None,
                    usage: Usage | None = None, *, idx: int = 0, replica: int = 0,
-                   mode: str | None = None, stats: CacheStats | None = None):
-        """Returns the assistant message object (may carry .tool_calls)."""
+                   mode: str | None = None, stats: CacheStats | None = None,
+                   info: dict | None = None):
+        """Returns the assistant message object (may carry .tool_calls). If info
+        is given, it receives the cache key and whether the store served the call."""
+        info = info if info is not None else {}
         if self.cfg.fake_llm:
+            info.update(cache_key=None, cache_hit=None)
             return _FakeMessage(messages, tools)
         mode = mode or self.cfg.cache_mode
         if mode not in MODES:
@@ -116,10 +120,12 @@ class LLMClient:
 
         if mode == "off":
             stats.chat_miss(idx)
+            info.update(cache_key=None, cache_hit=False)
             data = await self._call_chat(request, usage)
         else:
             key = chat_key(request, replica)
             data = self.cache.get(key)
+            info.update(cache_key=key, cache_hit=data is not None)
             if data is not None:
                 stats.chat_hit()
             else:
@@ -260,13 +266,19 @@ class RunLLM:
     def embed_space(self) -> str:
         return self.client.embed_space
 
-    async def chat(self, messages: list[dict], tools: list[dict] | None = None):
+    async def chat(self, messages: list[dict], tools: list[dict] | None = None,
+                   info: dict | None = None):
+        """info, if given, receives idx (this run's call number), replica,
+        cache_key and cache_hit."""
         # Numbered before the first await, so concurrent agents started in index
         # order (asyncio.gather) always get the same numbers.
         idx = next(self._calls)
         replica = self.replica if idx >= self.replica_from_call else 0
+        info = info if info is not None else {}
+        info.update(idx=idx, replica=replica)
         return await self.client.chat(messages, tools, usage=self.usage, idx=idx,
-                                      replica=replica, mode=self.mode, stats=self.stats)
+                                      replica=replica, mode=self.mode, stats=self.stats,
+                                      info=info)
 
     async def embed(self, texts: list[str]) -> list[list[float]]:
         return await self.client.embed(texts, usage=self.usage, mode=self.mode, stats=self.stats)

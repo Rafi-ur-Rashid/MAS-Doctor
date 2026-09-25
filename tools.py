@@ -19,10 +19,11 @@ import json
 import operator
 import posixpath
 import sqlite3
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from config import CFG
+from events import artifact
 
 
 # ============================================================= registry types
@@ -43,11 +44,24 @@ class Tool:
 
 @dataclass
 class ToolCtx:
-    """Who is calling a tool, from which run. Built by the runtime, never by the model."""
+    """Who is calling a tool, from which run. Built by the runtime, never by the model.
+
+    ref is a unique, deterministic id for this tool call ("<call_idx>.<k>"); a tool
+    that creates content registers it through emit() and lists the artifact ids it
+    read and wrote in reads/writes, which go on the tool_result event."""
     run: Any                  # RunContext
     agent_idx: int
     agent_name: str
     round_idx: int
+    ref: str = ""
+    emit: Callable[[dict], None] | None = None
+    reads: list = field(default_factory=list)
+    writes: list = field(default_factory=list)
+
+    def register(self, record: dict) -> str:
+        if self.emit is not None:
+            self.emit(record)
+        return record["id"]
 
 
 class ToolRegistry:
@@ -223,6 +237,12 @@ def _norm(rel: str) -> str:
     return p
 
 
+def _put_file(ctx: ToolCtx, path: str, content: str) -> None:
+    ctx.run.files[path] = content
+    ctx.run.file_ids[path] = aid = f"file:g{ctx.run.generation}:{ctx.ref}"
+    ctx.writes.append(ctx.register(artifact(aid, "file", ctx.agent_name, content, path=path)))
+
+
 @REGISTRY.register(
     "write_file", "Write text to a file in the shared workspace (overwrites).",
     {"type": "object",
@@ -231,7 +251,7 @@ def _norm(rel: str) -> str:
      "required": ["path", "content"]},
     needs_ctx=True)
 def write_file(ctx: ToolCtx, path: str, content: str):
-    ctx.run.files[_norm(path)] = content
+    _put_file(ctx, _norm(path), content)
     return {"path": path, "bytes_written": len(content.encode())}
 
 
@@ -240,9 +260,11 @@ def write_file(ctx: ToolCtx, path: str, content: str):
     {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]},
     needs_ctx=True)
 def read_file(ctx: ToolCtx, path: str):
-    content = ctx.run.files.get(_norm(path))
+    p = _norm(path)
+    content = ctx.run.files.get(p)
     if content is None:
         return {"error": f"no such file: {path}"}
+    ctx.reads.append(ctx.run.file_ids[p])
     return {"path": path, "content": content[:8000]}
 
 
@@ -264,7 +286,7 @@ def list_files(ctx: ToolCtx):
 def send_email(ctx: ToolCtx, to: str, subject: str, body: str):
     record = {"seq": ctx.run.clock(), "from": ctx.agent_name,
               "to": to, "subject": subject, "body": body}
-    ctx.run.files["outbox.jsonl"] = ctx.run.files.get("outbox.jsonl", "") + json.dumps(record) + "\n"
+    _put_file(ctx, "outbox.jsonl", ctx.run.files.get("outbox.jsonl", "") + json.dumps(record) + "\n")
     return {"status": "queued (simulated)", "to": to, "subject": subject}
 
 
@@ -277,7 +299,11 @@ def send_email(ctx: ToolCtx, to: str, subject: str, body: str):
      "required": ["key", "value"]},
     needs_ctx=True)
 def blackboard_write(ctx: ToolCtx, key: str, value: str):
-    return ctx.run.blackboard.write(key, value, author=ctx.agent_name, round_idx=ctx.round_idx)
+    bb = ctx.run.blackboard
+    out = bb.write(key, value, author=ctx.agent_name, round_idx=ctx.round_idx)
+    ctx.writes.append(ctx.register(artifact(bb.ids[key], "blackboard_value", ctx.agent_name,
+                                            value, key=key)))
+    return out
 
 
 @REGISTRY.register(
@@ -285,4 +311,7 @@ def blackboard_write(ctx: ToolCtx, key: str, value: str):
     {"type": "object", "properties": {"key": {"type": "string"}}, "required": []},
     needs_ctx=True)
 def blackboard_read(ctx: ToolCtx, key: str | None = None):
-    return ctx.run.blackboard.read(key)
+    bb = ctx.run.blackboard
+    if key is not None and key in bb.data:
+        ctx.reads.append(bb.ids[key])
+    return bb.read(key)
