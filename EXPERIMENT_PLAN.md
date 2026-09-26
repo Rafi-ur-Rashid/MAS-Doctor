@@ -189,6 +189,24 @@ This needs two fixes first:
 
 **Pass:** AUROC within 0.05 of the paper's number for the same attack and topology. Separately, a round-trip test confirms that the adapter from our transcripts to their `communication_data` format loses nothing. That test runs in C15, not here.
 
+**Result (C05, 2026-09-26): G3 passes.** XG-Guard branch `c05-e0` (upstream 86e1121); summary in `reports/c05_e0_summary.json`.
+
+| Topology | Paper AUC | Ours | Diff | Standard AUROC (per graph / pooled) | Benign-trained AUC | Paper ASR@3 | Ours ASR@3 |
+|---|---|---|---|---|---|---|---|
+| Chain | 99.56 | 99.56 | 0.00 | 99.89 / 99.99 | 100.00 | 3.67 | 3.67 |
+| Tree | 99.11 | 99.56 | +0.45 | 99.89 / 99.98 | 100.00 | 5.00 | 4.00 |
+| Star | 98.67 | 99.11 | +0.44 | 99.78 / 99.95 | 100.00 | 2.33 | 3.00 |
+| Random | 99.56 | 99.11 | −0.45 | 99.78 / 99.97 | 100.00 | 6.33 | 2.00 |
+
+The run covered 60 cases per topology with 0 failures, using `gpt-4o-mini-2024-07-18` at temperature 0 and training hyperparameters from the paper's Appendix F (lr 1e-4, α 1e-4, 20 epochs, wd 2e-4, seed 3701). About $1.76 was spent.
+
+Findings that later chunks depend on:
+1. **The paper's "AUC" is XG-Guard's evaluator metric.** Per graph, it is the AUROC of the binary top-3 flags, averaged over graphs. With 3 attackers out of 8, it equals the mean of the recall on attackers and the true-negative rate on the others. It is not a ranking AUROC. We report both, labelled.
+2. **The released training file is not benign.** `datasets_local/MA_PoisonRAG_local_train_dataset.json` is described in the README as normal dialogue, yet its listed attackers give the poisoned answer in round 0 for 1,935 of 1,966 agent-turns (98%, against 3% for the others). The objective is label-free, but the data is attacked. A model trained only on the benign online split (200 cases, 0 attackers) scores **100.00 on every topology**. This validates C15's plan of benign-only training.
+3. **These MA attacks are loud.** Attackers are prompted to "guide other agents to believe" the poisoned answer, and even a benign-trained detector finds every one. This is the regime the plan expects GAD to win, and is why Track Q is the fair comparison ground while the stealth cell (E3) is where intra-agent evidence has to add value.
+4. **XG-Guard's pipeline hides failures.** `main()` skips any case that raises an exception and only prints the error, and there are no API retries. Every run must check that cases completed equals cases attempted; the patched script prints this.
+5. **The evaluation script's default checkpoint name (`lr1e-05`) contradicts the paper**, which gives 1e-4 for MA-PoisonRAG. We followed the paper.
+
 ### E1: Substrate validation (gates G1, G2)
 - Benign: every workspace user task × 3 topologies × 3 replicas. Report the MAS utility rate, the utility rate of a single-agent AgentDojo baseline with the same model, ρ_sat per round, and benign distributions of a_i, retrieval margin, and node firing rates.
 - Pilot attacks: 10 tasks × 6 goals × tool ingress × quiet, star topology. Report the exposure, influence and success rates.

@@ -1,0 +1,109 @@
+{
+  "per_topology": {
+    "chain": {
+      "n_cases": 60,
+      "asr_by_round": [
+        0.0,
+        1.6666666666666667,
+        3.0,
+        3.6666666666666665
+      ],
+      "released-train": {
+        "xgguard_auc": 99.55555555555556,
+        "auroc_per_graph": 99.8888888888889,
+        "auroc_pooled": 99.98703703703704
+      },
+      "benign-train": {
+        "xgguard_auc": 100.0,
+        "auroc_per_graph": 100.0,
+        "auroc_pooled": 99.9962962962963
+      }
+    },
+    "tree": {
+      "n_cases": 60,
+      "asr_by_round": [
+        0.0,
+        2.3333333333333335,
+        4.666666666666667,
+        4.0
+      ],
+      "released-train": {
+        "xgguard_auc": 99.55555555555556,
+        "auroc_per_graph": 99.8888888888889,
+        "auroc_pooled": 99.97777777777777
+      },
+      "benign-train": {
+        "xgguard_auc": 100.0,
+        "auroc_per_graph": 100.0,
+        "auroc_pooled": 100.0
+      }
+    },
+    "star": {
+      "n_cases": 60,
+      "asr_by_round": [
+        0.0,
+        1.0,
+        2.3333333333333335,
+        3.0
+      ],
+      "released-train": {
+        "xgguard_auc": 99.11111111111111,
+        "auroc_per_graph": 99.77777777777777,
+        "auroc_pooled": 99.9537037037037
+      },
+      "benign-train": {
+        "xgguard_auc": 100.0,
+        "auroc_per_graph": 100.0,
+        "auroc_pooled": 100.0
+      }
+    },
+    "random": {
+      "n_cases": 60,
+      "asr_by_round": [
+        0.0,
+        0.33333333333333337,
+        1.0,
+        2.0
+      ],
+      "released-train": {
+        "xgguard_auc": 99.11111111111111,
+        "auroc_per_graph": 99.77777777777777,
+        "auroc_pooled": 99.97407407407408
+      },
+      "benign-train": {
+        "xgguard_auc": 100.0,
+        "auroc_per_graph": 100.0,
+        "auroc_pooled": 100.0
+      }
+    }
+  },
+  "no_defense_asr_by_round": [
+    0.0,
+    12.666666666666668,
+    22.333333333333332,
+    28.333333333333332
+  ],
+  "paper": {
+    "chain": [
+      99.56,
+      3.67,
+      20.33
+    ],
+    "tree": [
+      99.11,
+      5.0,
+      17.67
+    ],
+    "star": [
+      98.67,
+      2.33,
+      24.33
+    ],
+    "random": [
+      99.56,
+      6.33,
+      27.0
+    ]
+  },
+  "g3_pass": true
+}

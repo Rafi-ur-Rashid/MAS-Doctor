@@ -71,6 +71,11 @@ def build_manifest() -> dict:
         "xgguard": {
             "dir": str(CFG.xgguard_dir),
             "commit": _git(CFG.xgguard_dir, "rev-parse", "HEAD"),
+            "branch": _git(CFG.xgguard_dir, "rev-parse", "--abbrev-ref", "HEAD"),
+            # the upstream commit our local patches (branch c05-e0) sit on
+            "upstream_base": _git(CFG.xgguard_dir, "merge-base", "HEAD", "main"),
+            # tracked-file changes only; untracked caches, results and tools.json are fine
+            "dirty": bool(_git(CFG.xgguard_dir, "status", "--porcelain", "--untracked-files=no")),
         },
     }
 

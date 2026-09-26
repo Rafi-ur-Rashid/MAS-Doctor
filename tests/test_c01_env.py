@@ -65,7 +65,10 @@ def test_manifest():
     assert m["llm"]["model"] == CFG.model and m["llm"]["reasoning_model"] is True
     assert m["packages"]["agentdojo"] == "0.1.35"
     assert m["benchmark"]["agentdojo_benchmark"] == "v1.2.2"
-    assert m["xgguard"]["commit"] == "86e1121512f76800f80d4687e492c7f99f049929"
+    # local patches live on a branch; what must not move is the upstream base,
+    # and the patched code must be committed
+    assert m["xgguard"]["upstream_base"] == "86e1121512f76800f80d4687e492c7f99f049929"
+    assert m["xgguard"]["dirty"] is False
 
 
 def test_fake_llm_smoke(tmp_path):

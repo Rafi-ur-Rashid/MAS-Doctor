@@ -8,3 +8,5 @@ cache/
 results/
 *.sqlite
 *.sqlite3
+EXPERIMENT_PLAN.md
+PROGRESS.md

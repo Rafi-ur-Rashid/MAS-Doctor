@@ -12,11 +12,13 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 export PIP_CACHE_DIR=${PIP_CACHE_DIR:-/scratch/mur5028/cache/pip} PYTHONNOUSERSITE=1 PYTHONPATH=
 
 "$CONDA" create -y -q -n mastrust python=3.12
-"$CONDA" env config vars set -n mastrust PYTHONNOUSERSITE=1 PYTHONPATH=
+# TRANSFORMERS_CACHE: this machine points it at a shared /scratch/hf_cache whose lock
+# files are not writable by this account; use the private cache under HF_HOME instead.
+"$CONDA" env config vars set -n mastrust PYTHONNOUSERSITE=1 PYTHONPATH= TRANSFORMERS_CACHE=/scratch/mur5028/cache/hub
 "$CONDA" run -n mastrust python -m pip install -r "$HERE/mastrust.lock.txt"
 
 "$CONDA" create -y -q -n xgguard python=3.11
-"$CONDA" env config vars set -n xgguard PYTHONNOUSERSITE=1 PYTHONPATH=
+"$CONDA" env config vars set -n xgguard PYTHONNOUSERSITE=1 PYTHONPATH= TRANSFORMERS_CACHE=/scratch/mur5028/cache/hub
 "$CONDA" run -n xgguard python -m pip install torch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1 \
     --index-url https://download.pytorch.org/whl/cu124
 "$CONDA" run -n xgguard python -m pip install torch_scatter==2.1.2 torch_sparse==0.6.18 \
