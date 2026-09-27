@@ -14,7 +14,8 @@ LangGraph/AutoGen abstraction, so every prompt and every message hop is inspecta
 |---|---|
 | `config.py`   | model, paths, budgets. Everything tunable in one dataclass. |
 | `llm.py`      | async OpenAI wrapper: retries, concurrency cap, usage accounting, offline fake mode |
-| `tools.py`    | the tool registry + 8 executing tools |
+| `tools.py`    | the tool registry + 8 executing tools (the "builtin" toolset) |
+| `agentdojo_tools.py` | the "workspace" toolset: AgentDojo's 24 workspace tools, field labels, annotations, zones, outcomes |
 | `memory.py`   | working / episodic (vector) / shared blackboard |
 | `run_context.py` | one run's mutable state + named state snapshots |
 | `manifest.py` | versions, models and code hash for every run record |
@@ -129,11 +130,12 @@ Each run also writes `runs/<run_id>/events.jsonl`: one record per line, either a
 | `bb<seq>` | a blackboard value; the moderator's prompt also references its `key` field |
 | `file:g<gen>:<call>.<k>` | a workspace file version (`gen` = snapshot generation) |
 | `final` | the moderator's synthesis |
+| `obs:<call>.<k>:<n>` | the n-th value in a workspace tool result, with its path and provenance label |
 
 Events: `run_start`, `prompt_delivery` (registered vs delivered prompt hash), `llm_call`
 (the message ids that formed the context, a hash of what was sent, the cache key, the
-output id), `tool_dispatch`, `tool_result` (result id plus the artifact ids the tool read
-and wrote), `mem_read` (candidates, returned write ids, similarities, top-1/top-2 margin),
+output id), `tool_dispatch`, `tool_result` (result id, the artifact ids the tool read
+and wrote, and its observation ids), `mem_read` (candidates, returned write ids, similarities, top-1/top-2 margin),
 `mem_write`, `msg_send`, `msg_recv`.
 
 A recipe is a list of parts: runtime-written literal text, or a reference to an artifact.
@@ -155,6 +157,19 @@ one list per round. That is deliberately XG-Guard's transcript schema, so these 
 be fed to a graph-anomaly detector later without reshaping. Also included: every tool call
 with arguments and truncated results, the blackboard and its authored log, the run's
 workspace files, and the synthesis.
+
+## AgentDojo workspace (Track W)
+
+`RunContext(..., toolset="workspace")` plus `agentdojo_tools.attach(ctx, user_task_id,
+injections)` gives a run AgentDojo's workspace environment (suite v1.2.2). Tools run
+through AgentDojo's own `FunctionsRuntime`, and the model sees exactly the text AgentDojo
+would show it. Outcomes are AgentDojo's `utility()` and `security()`, via
+`agentdojo_tools.utility` and `agentdojo_tools.security`. Every value in a result is logged
+with a label: `attested` (metadata the service vouches for), `untrusted` (free text such
+as a body or file content, where every injection vector sits), `agent_written` (a value an
+agent's own call put there during the run) or `runtime` (status and error strings). New
+emails and files are stamped by a per-run logical clock instead of the wall clock, and the
+env must run with `PYTHONHASHSEED=0`. Both are needed so a replay sees identical tool results.
 
 ## Adding to it
 

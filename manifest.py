@@ -54,6 +54,8 @@ def build_manifest() -> dict:
         "git_commit": commit,
         "git_dirty": bool(dirty) if dirty is not None else None,
         "python": platform.python_version(),
+        # set iteration order, and so AgentDojo's participant lists, depends on it (C06)
+        "hash_randomization": bool(sys.flags.hash_randomization),
         "env_prefix": sys.prefix,
         "packages": {p: _version(p) for p in PACKAGES},
         "llm": {

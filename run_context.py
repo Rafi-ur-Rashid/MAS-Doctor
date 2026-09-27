@@ -16,6 +16,12 @@ store and where the run first diverged from it.
 The run's event log (C04, events.py) lives here too. State loaded from a snapshot
 is registered in it first, as artifacts with producer "snapshot", so every later
 reference to a loaded memory item, blackboard value or file resolves.
+
+A run also names its toolset (C06): "builtin" (tools.py) or "workspace" (AgentDojo's
+suite, agentdojo_tools.py). A workspace run carries its AgentDojo environment in
+`workspace` (agentdojo_tools.attach). That environment is not part of the snapshot:
+every run starts from its user task's own environment, as in AgentDojo, while agent
+memory is what persists between runs.
 """
 from __future__ import annotations
 
@@ -30,6 +36,7 @@ from config import CFG
 from events import EventLog, artifact
 from llm import Usage
 from memory import Blackboard, MemoryItem, VectorStore
+from tools import get_toolset
 
 EMPTY = "empty"
 SNAPSHOT_FORMAT = 2   # 2: memory items carry write_id; files carry artifact ids
@@ -49,11 +56,14 @@ def snapshot_path(name: str, state_dir: Path | None = None) -> Path:
 class RunContext:
     def __init__(self, client, agent_names: list[str], state_from: str = EMPTY,
                  state_dir: Path | None = None, cache_mode: str | None = None,
-                 replica: int = 0, replica_from_call: int = 0):
+                 replica: int = 0, replica_from_call: int = 0, toolset: str = "builtin"):
         """client: a shared LLMClient (or any object with the same for_run).
         agent_names: the roster; episodic stores are keyed by agent name."""
         self.state_dir = state_dir or CFG.state_dir
         self.state_from = state_from
+        self.toolset = toolset
+        self.tools = get_toolset(toolset)
+        self.workspace = None          # an agentdojo_tools.WorkspaceState, for toolset "workspace"
         self.usage = Usage()
         self.cache_stats = CacheStats()
         self.llm = client.for_run(self.usage, stats=self.cache_stats,

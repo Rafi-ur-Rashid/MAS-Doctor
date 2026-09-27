@@ -14,7 +14,10 @@ export PIP_CACHE_DIR=${PIP_CACHE_DIR:-/scratch/mur5028/cache/pip} PYTHONNOUSERSI
 "$CONDA" create -y -q -n mastrust python=3.12
 # TRANSFORMERS_CACHE: this machine points it at a shared /scratch/hf_cache whose lock
 # files are not writable by this account; use the private cache under HF_HOME instead.
-"$CONDA" env config vars set -n mastrust PYTHONNOUSERSITE=1 PYTHONPATH= TRANSFORMERS_CACHE=/scratch/mur5028/cache/hub
+# PYTHONHASHSEED=0 (C06): AgentDojo orders event participants through a set, so string
+# hashing must be the same in every process or a replayed run sees different tool results.
+"$CONDA" env config vars set -n mastrust PYTHONNOUSERSITE=1 PYTHONPATH= \
+    TRANSFORMERS_CACHE=/scratch/mur5028/cache/hub PYTHONHASHSEED=0
 "$CONDA" run -n mastrust python -m pip install -r "$HERE/mastrust.lock.txt"
 
 "$CONDA" create -y -q -n xgguard python=3.11

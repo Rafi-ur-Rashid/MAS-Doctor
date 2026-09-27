@@ -18,6 +18,8 @@ ROOT = Path(__file__).resolve().parents[1]
 def test_env_is_isolated():
     assert not site.ENABLE_USER_SITE, "~/.local site-packages leak in; use `conda run -n mastrust`"
     assert not os.environ.get("PYTHONPATH"), "PYTHONPATH leaks in; use `conda run -n mastrust`"
+    # C06: fixed string hashing, so set iteration order is the same in every process
+    assert sys.flags.hash_randomization == 0, "PYTHONHASHSEED=0 missing; use `conda run -n mastrust`"
 
 
 @pytest.mark.parametrize("mod", ["openai", "agentdojo", "numpy", "torch", "sentence_transformers",

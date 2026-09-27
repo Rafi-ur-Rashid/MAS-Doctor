@@ -99,6 +99,7 @@ class AgentGraph:
                       sampling=sampling_params(CFG, CFG.model), schedule=schedule,
                       rounds=rounds, adj=self.adj.tolist(),
                       agents=[a.name for a in self.agents], state_from=self.ctx.state_from,
+                      toolset=self.ctx.toolset,
                       replica=self.ctx.llm.replica if hasattr(self.ctx.llm, "replica") else 0,
                       replica_from_call=getattr(self.ctx.llm, "replica_from_call", 0)))
         ev.emit(artifact("task", "user_task", "user", task))

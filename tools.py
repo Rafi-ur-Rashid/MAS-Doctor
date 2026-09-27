@@ -10,6 +10,9 @@ Tools that touch run state (blackboard, workspace files, outbox) are registered
 with needs_ctx=True and receive a ToolCtx naming the run, the calling agent and
 the round. There is no global run state: two runs in one process cannot see
 each other's writes.
+
+These tools form the "builtin" toolset. A run picks its toolset by name
+(get_toolset); "workspace" is AgentDojo's workspace suite (agentdojo_tools.py, C06).
 """
 from __future__ import annotations
 
@@ -48,7 +51,8 @@ class ToolCtx:
 
     ref is a unique, deterministic id for this tool call ("<call_idx>.<k>"); a tool
     that creates content registers it through emit() and lists the artifact ids it
-    read and wrote in reads/writes, which go on the tool_result event."""
+    read and wrote in reads/writes, which go on the tool_result event. A tool whose
+    result is structured also lists one artifact per value in it (observations)."""
     run: Any                  # RunContext
     agent_idx: int
     agent_name: str
@@ -57,11 +61,17 @@ class ToolCtx:
     emit: Callable[[dict], None] | None = None
     reads: list = field(default_factory=list)
     writes: list = field(default_factory=list)
+    observations: list = field(default_factory=list)   # field-level result artifacts (C06)
 
     def register(self, record: dict) -> str:
         if self.emit is not None:
             self.emit(record)
         return record["id"]
+
+
+class RuntimeFault(RuntimeError):
+    """A fault in the runtime itself, not a bad call by the model. Raised through
+    ToolRegistry.call instead of being turned into an error the model reads."""
 
 
 class ToolRegistry:
@@ -93,6 +103,8 @@ class ToolRegistry:
             result = tool.fn(ctx, **args) if tool.needs_ctx else tool.fn(**args)
             if asyncio.iscoroutine(result):
                 result = await result
+        except RuntimeFault:
+            raise
         except TypeError as e:
             return json.dumps({"error": f"bad arguments for {name}: {e}"})
         except Exception as e:
@@ -101,6 +113,17 @@ class ToolRegistry:
 
 
 REGISTRY = ToolRegistry()
+
+
+def get_toolset(name: str) -> ToolRegistry:
+    """The registry a run uses, by name. The name goes on run_start, so the tool
+    specs of every logged call can be rebuilt (events.verify_records)."""
+    if name == "builtin":
+        return REGISTRY
+    if name == "workspace":
+        from agentdojo_tools import workspace_registry   # imports agentdojo; only when used
+        return workspace_registry()
+    raise ValueError(f"unknown toolset {name!r} (builtin|workspace)")
 
 
 # ================================================================ calculator

@@ -4,8 +4,9 @@ The log is the substrate the monitor reads (EXPERIMENT_PLAN.md §2.1, §4.1). Tw
 kinds of record go into runs/<id>/events.jsonl, one JSON object per line:
 
   artifact  a piece of content, registered once: the task, a system prompt, a
-            model output, a tool result, a memory item, a blackboard value, a
-            workspace file, an agent's final response, or a chat message.
+            model output, a tool result, one value inside a tool result (an
+            observation, C06), a memory item, a blackboard value, a workspace file,
+            an agent's final response, or a chat message.
   event     something that happened: run_start, prompt_delivery, llm_call,
             tool_dispatch, tool_result, mem_read, mem_write, msg_send, msg_recv.
 
@@ -30,7 +31,9 @@ from pathlib import Path
 
 from cache import canonical, chat_key
 
-SCHEMA_VERSION = 1
+# 1 (C04); 2 (C06): run_start names the toolset, tool_result lists observation
+# artifacts (one per value in a structured tool result, with a provenance label)
+SCHEMA_VERSION = 2
 
 
 def sha256(obj) -> str:
@@ -160,7 +163,7 @@ def verify_records(records: list[dict], cache=None) -> dict:
       - with a cache: the rebuilt request has the recorded cache key, and that
         key is present in the store (the stored request is what was sent).
     Returns counts; raises AssertionError on the first failure."""
-    from tools import REGISTRY   # tool specs are rebuilt from the registry
+    from tools import get_toolset   # tool specs are rebuilt from the run's toolset
 
     artifacts: dict[str, dict] = {}
     for r in records:
@@ -175,6 +178,7 @@ def verify_records(records: list[dict], cache=None) -> dict:
                     f"{r['id']}: {p['ref']} has no field {p.get('field')}"
 
     start = next(r for r in records if r.get("ev") == "run_start")
+    tools = get_toolset(start.get("toolset", "builtin"))    # schema 1 logs predate toolsets
     calls = [r for r in records if r.get("ev") == "llm_call"]
     keys_checked = 0
     for c in calls:
@@ -184,7 +188,7 @@ def verify_records(records: list[dict], cache=None) -> dict:
         if c.get("cache_key"):
             request = dict(model=start["model"], messages=msgs, **start["sampling"])
             if c["tools"]:
-                request["tools"] = REGISTRY.specs(c["tools"])
+                request["tools"] = tools.specs(c["tools"])
                 request["tool_choice"] = "auto"
             assert chat_key(request, c["replica"]) == c["cache_key"], \
                 f"llm_call {c['call_idx']}: rebuilt request has a different cache key"

@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from config import CFG
 from events import Composite, artifact, event, message_artifact, sha256
 from memory import AgentMemory
-from tools import REGISTRY, ToolCtx
+from tools import ToolCtx
 
 
 @dataclass
@@ -44,7 +44,11 @@ class Agent:
         self.name = spec.name
         self.system_prompt = spec.system_prompt(idx, peers)
         registered = registered_prompt if registered_prompt is not None else self.system_prompt
-        self.tool_specs = REGISTRY.specs(spec.tools) if spec.tools else []
+        self.tools = run.tools
+        unknown = sorted(set(spec.tools) - set(self.tools.names()))
+        if unknown:
+            raise ValueError(f"{spec.name}: tools {unknown} are not in toolset {run.toolset!r}")
+        self.tool_specs = self.tools.specs(spec.tools) if spec.tools else []
         self.last_response: str = ""
         self.last_response_id: str | None = None
         self.tool_log: list[dict] = []
@@ -187,13 +191,14 @@ class Turn:
                             args=args, parsed=parsed))
             ctx = ToolCtx(run=a.run, agent_idx=a.idx, agent_name=a.name,
                           round_idx=self.round_idx, ref=ref, emit=self.emit)
-            result = await REGISTRY.call(call.function.name, args, ctx)
+            result = await a.tools.call(call.function.name, args, ctx)
             tr_id = f"tr:{ref}"
             self.emit(artifact(tr_id, "tool_result", a.name, result,
                                tool=call.function.name, tool_call_id=call.id))
             self.emit(event("tool_result", agent=a.name, agent_idx=a.idx, tool_call_id=call.id,
                             tool=call.function.name, result=tr_id,
-                            reads=ctx.reads, writes=ctx.writes))
+                            reads=ctx.reads, writes=ctx.writes,
+                            observations=ctx.observations))
             self.records.append({"round": self.round_idx, "step": self.iters,
                                  "tool": call.function.name, "args": args,
                                  "result": result[:500]})
