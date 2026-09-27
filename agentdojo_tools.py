@@ -245,7 +245,8 @@ def openai_spec(f) -> dict:
 
 @lru_cache(maxsize=None)
 def workspace_registry() -> ToolRegistry:
-    reg = ToolRegistry()
+    # AgentDojo's ToolsExecutor answers a call to a tool it does not offer with this
+    reg = ToolRegistry(unavailable=lambda name: f"Invalid tool {name} provided.")
     for f in workspace_suite().tools:
         spec = openai_spec(f)["function"]
         reg._tools[f.name] = Tool(f.name, spec["description"], spec["parameters"],

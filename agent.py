@@ -4,7 +4,6 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 
-from config import CFG
 from events import Composite, artifact, event, message_artifact, sha256
 from memory import AgentMemory
 from tools import ToolCtx
@@ -16,9 +15,15 @@ class AgentSpec:
     role: str
     instructions: str
     tools: list[str] = field(default_factory=list)
+    # A team can supply its own system prompt, formatted with idx, name, role,
+    # instructions and peers. None keeps the original (builtin) prompt below.
+    template: str | None = None
 
     def system_prompt(self, idx: int, peers: list[str]) -> str:
         peer_line = ", ".join(peers) if peers else "none"
+        if self.template is not None:
+            return self.template.format(idx=idx, name=self.name, role=self.role,
+                                        instructions=self.instructions, peers=peer_line)
         return (
             f"You are agent_{idx} ({self.name}), the {self.role} in a multi-agent team.\n"
             f"{self.instructions}\n\n"
@@ -139,7 +144,7 @@ class Turn:
         if self.done:
             return
         a, mem = self.agent, self.agent.memory
-        forced = self.iters >= CFG.max_tool_iters
+        forced = self.iters >= a.run.max_tool_iters
         if forced:
             # tool budget exhausted -- force a text answer
             note = "Tool budget reached. Answer now using what you have."
@@ -185,13 +190,17 @@ class Turn:
                 parsed = True
             except json.JSONDecodeError:
                 args, parsed = {}, False
+            allowed = call.function.name in a.spec.tools
             self.emit(event("tool_dispatch", agent=a.name, agent_idx=a.idx, round=self.round_idx,
                             call_idx=self.pending_call_idx, k=k, tool_call_id=call.id,
                             tool=call.function.name, arguments=call.function.arguments,
-                            args=args, parsed=parsed))
+                            args=args, parsed=parsed, allowed=allowed))
             ctx = ToolCtx(run=a.run, agent_idx=a.idx, agent_name=a.name,
                           round_idx=self.round_idx, ref=ref, emit=self.emit)
-            result = await a.tools.call(call.function.name, args, ctx)
+            if allowed:
+                result = await a.tools.call(call.function.name, args, ctx)
+            else:   # the model named a tool it was not given: never executed
+                result = a.tools.unavailable(call.function.name)
             tr_id = f"tr:{ref}"
             self.emit(artifact(tr_id, "tool_result", a.name, result,
                                tool=call.function.name, tool_call_id=call.id))

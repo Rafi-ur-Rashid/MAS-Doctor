@@ -75,8 +75,12 @@ class RuntimeFault(RuntimeError):
 
 
 class ToolRegistry:
-    def __init__(self):
+    def __init__(self, unavailable: Callable[[str], str] | None = None):
+        """unavailable(name): the result a model gets for a tool that does not
+        exist or that its agent was not given."""
         self._tools: dict[str, Tool] = {}
+        self.unavailable = unavailable or (
+            lambda name: json.dumps({"error": f"unknown tool '{name}'"}))
 
     def register(self, name, description, parameters, needs_ctx: bool = False):
         def deco(fn):
@@ -94,7 +98,7 @@ class ToolRegistry:
     async def call(self, name: str, args: dict, ctx: ToolCtx | None = None) -> str:
         tool = self._tools.get(name)
         if tool is None:
-            return json.dumps({"error": f"unknown tool '{name}'"})
+            return self.unavailable(name)
         if "ctx" in args:   # the model must not be able to pose as another run or agent
             return json.dumps({"error": f"bad arguments for {name}: 'ctx' is reserved"})
         if tool.needs_ctx and ctx is None:

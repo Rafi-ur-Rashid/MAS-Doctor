@@ -56,7 +56,8 @@ def snapshot_path(name: str, state_dir: Path | None = None) -> Path:
 class RunContext:
     def __init__(self, client, agent_names: list[str], state_from: str = EMPTY,
                  state_dir: Path | None = None, cache_mode: str | None = None,
-                 replica: int = 0, replica_from_call: int = 0, toolset: str = "builtin"):
+                 replica: int = 0, replica_from_call: int = 0, toolset: str = "builtin",
+                 max_tool_iters: int | None = None):
         """client: a shared LLMClient (or any object with the same for_run).
         agent_names: the roster; episodic stores are keyed by agent name."""
         self.state_dir = state_dir or CFG.state_dir
@@ -64,6 +65,8 @@ class RunContext:
         self.toolset = toolset
         self.tools = get_toolset(toolset)
         self.workspace = None          # an agentdojo_tools.WorkspaceState, for toolset "workspace"
+        # LLM calls with tools per agent turn before a text answer is forced
+        self.max_tool_iters = max_tool_iters or CFG.max_tool_iters
         self.usage = Usage()
         self.cache_stats = CacheStats()
         self.llm = client.for_run(self.usage, stats=self.cache_stats,

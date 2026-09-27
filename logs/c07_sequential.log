@@ -1,0 +1,10 @@
+WARNING: overwriting environment variables set in the machine
+overwriting variable ['PYTHONPATH', 'TRANSFORMERS_CACHE']
+
+model gpt-5-mini-2025-08-07 | reasoning_effort low | cache replay-or-record | budget $0.80
+{"task": "user_task_0", "utility": true, "llm_calls": 20, "tool_calls": 13, "cost_upper": 0.0287, "hits": 14, "misses": 20, "truncated": 0, "run": "/scratch/mur5028/mas/runs/c07_user_task_0_star_sequential_r3"}
+{"task": "user_task_18", "utility": true, "llm_calls": 17, "tool_calls": 11, "cost_upper": 0.0269, "hits": 15, "misses": 17, "truncated": 0, "run": "/scratch/mur5028/mas/runs/c07_user_task_18_star_sequential_r3"}
+{"task": "user_task_33", "utility": true, "llm_calls": 19, "tool_calls": 9, "cost_upper": 0.0338, "hits": 11, "misses": 19, "truncated": 0, "run": "/scratch/mur5028/mas/runs/c07_user_task_33_star_sequential_r3"}
+
+utility 3/3 | process usage 56 chat calls, 71 embed calls, 229265 prompt + 15780 completion tokens (3584 reasoning), <= $0.0894
+
